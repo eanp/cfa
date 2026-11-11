@@ -10,6 +10,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Fix test assertions on bash 3.2/fish; clearer doctor message
 - One store per Cloudflare account holding any of: a **wrangler OAuth login**, a
   **Cloudflare API token**, a **cloudflared tunnel cert**.
 - `cfa login <name> <wrangler|token|cloudflared>`, `import`, `logout` (revokes wrangler
