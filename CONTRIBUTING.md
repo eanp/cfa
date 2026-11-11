@@ -55,6 +55,8 @@ separate port in `init_fish` — keep the two behaviourally identical (the tests
   fakes under `test/fixtures/bin/`, citing the version you checked.
 - Fail closed: if the selected account is missing, cloudflared must fail rather than use
   another account.
+- In tests, end every `[[ … ]]` assertion that isn't the last line with `|| false`:
+  bash 3.2 (macOS) otherwise ignores a failing `[[ ]]` and the test passes anyway.
 - Add or update a test for every behaviour change. Update both `README.md` and
   `README.id.md` when user-facing behaviour changes, and add a line to `CHANGELOG.md`.
 - Commit messages: short imperative subject (`Add cfa each`), body explains why.

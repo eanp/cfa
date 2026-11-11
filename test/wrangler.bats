@@ -4,7 +4,7 @@ load test_helper
 @test "wrangler login: stored per account, ID detected, becomes default" {
   run env FAKE_WR_ACCOUNTS=$A1 CLOUDFLARE_API_TOKEN=ambient "$CFA" login acme wrangler
   [ "$status" -eq 0 ]
-  [[ "$output" == *"saved wrangler login for 'acme' ($A1)"* ]]
+  [[ "$output" == *"saved wrangler login for 'acme' ($A1)"* ]] || false
   [ -f "$STORE/acme/xdg/.wrangler/config/default.toml" ]
   [ "$(mode "$STORE/acme/xdg/.wrangler/config/default.toml")" = 600 ]
   [ "$(cat "$STORE/acme/account_id")" = "$A1" ]
@@ -12,7 +12,7 @@ load test_helper
   # global wrangler login now points at acme
   [ "$(readlink "$WCFG")" = "$STORE/acme/xdg/.wrangler/config/default.toml" ]
   # wrangler ran with a scratch XDG dir and without the ambient token
-  [[ "$(cat "$HOME/.fake-wrangler-login-env")" == "$STORE/acme/.xdg-login."*"|<unset>" ]]
+  [[ "$(cat "$HOME/.fake-wrangler-login-env")" == "$STORE/acme/.xdg-login."*"|<unset>" ]] || false
 }
 
 @test "wrangler login never touches an existing global login" {
@@ -23,7 +23,7 @@ load test_helper
   grep -q MINE "$WCFG"
   run "$CFA" default acme
   [ "$status" -eq 1 ]
-  [[ "$output" == *"cfa import <name> wrangler"* ]]
+  [[ "$output" == *"cfa import <name> wrangler"* ]] || false
 }
 
 @test "second wrangler account keeps the first as default" {
@@ -56,10 +56,10 @@ load test_helper
 @test "wrangler login with several visible accounts needs an explicit ID" {
   run env FAKE_WR_ACCOUNTS="$A1,$B2" "$CFA" login acme wrangler
   [ "$status" -eq 0 ]
-  [[ "$output" == *"cfa account-id acme"* ]]
+  [[ "$output" == *"cfa account-id acme"* ]] || false
   [ ! -f "$STORE/acme/account_id" ]
   run "$CFA" doctor
-  [[ "$output" == *"acme: unknown account ID"* ]]
+  [[ "$output" == *"acme: unknown account ID"* ]] || false
   "$CFA" -q account-id acme "$B2"
   [ "$(cat "$STORE/acme/account_id")" = "$B2" ]
   run "$CFA" account-id acme nothex
@@ -72,7 +72,7 @@ load test_helper
   mkdir -p "$HOME/.wrangler/config"
   run env FAKE_WR_ACCOUNTS=$A1 "$CFA" login acme wrangler
   [ "$status" -eq 1 ]
-  [[ "$output" == *"cfa import <name> wrangler"* ]]
+  [[ "$output" == *"cfa import <name> wrangler"* ]] || false
 }
 
 @test "import wrangler adopts the global login and links it back" {
@@ -84,7 +84,7 @@ load test_helper
   [ "$(readlink "$WCFG")" = "$STORE/acme/xdg/.wrangler/config/default.toml" ]
   run "$CFA" import other wrangler
   [ "$status" -eq 1 ]
-  [[ "$output" == *"already managed"* ]]
+  [[ "$output" == *"already managed"* ]] || false
 }
 
 @test "token login reads stdin, detects the ID, stores 0600" {
@@ -93,7 +93,7 @@ load test_helper
   [ "$(cat "$STORE/ci/token")" = tok-ABCDEFGH ]
   [ "$(mode "$STORE/ci/token")" = 600 ]
   [ "$(cat "$STORE/ci/account_id")" = "$C3" ]
-  [[ "$output" != *ABCDEFGH* ]]
+  [[ "$output" != *ABCDEFGH* ]] || false
 }
 
 @test "token login: ambiguous ID fails cleanly, --account-id works" {
@@ -111,12 +111,12 @@ load test_helper
   login_wr acme "$A1"
   run env FAKE_CF_ACCOUNT=$B2 "$CFA" login acme cloudflared
   [ "$status" -eq 1 ]
-  [[ "$output" == *"is Cloudflare account $A1"* ]]
+  [[ "$output" == *"is Cloudflare account $A1"* ]] || false
   [ ! -f "$STORE/acme/cert.pem" ]
   FAKE_CF_ACCOUNT=$A1 "$CFA" -q login acme cloudflared
   [ -f "$STORE/acme/cert.pem" ]
   run "$CFA" list --json
-  [[ "$output" == *'"credentials":["wrangler","cloudflared"]'* ]]
+  [[ "$output" == *'"credentials":["wrangler","cloudflared"]'* ]] || false
 }
 
 @test "exec: OAuth account gets XDG_CONFIG_HOME, token account gets the token" {
@@ -144,7 +144,7 @@ load test_helper
   login_wr acme "$A1"
   login_tok ci "$C3"
   run "$CFA" each -- wrangler whoami-ish
-  [[ "$output" == *"==> acme"*"account=$A1 xdg=$STORE/acme/xdg"*"==> ci"*"token=TOKEN-ci-xyz123 account=$C3"* ]]
+  [[ "$output" == *"==> acme"*"account=$A1 xdg=$STORE/acme/xdg"*"==> ci"*"token=TOKEN-ci-xyz123 account=$C3"* ]] || false
 }
 
 @test "logout wrangler revokes and unlinks the default" {
@@ -152,12 +152,12 @@ load test_helper
   login_tok acme "$A1"
   run "$CFA" logout acme wrangler
   [ "$status" -eq 0 ]
-  [[ "$output" == *"revoked"* ]]
+  [[ "$output" == *"revoked"* ]] || false
   [ ! -e "$STORE/acme/xdg" ]
   [ ! -L "$WCFG" ] && [ ! -e "$WCFG" ]
   [ -f "$STORE/acme/token" ]
   run "$CFA" logout acme token
-  [[ "$output" == *"has no credentials left"* ]]
+  [[ "$output" == *"has no credentials left"* ]] || false
   [ ! -e "$STORE/acme" ]
   [ ! -f "$STORE/default" ]
 }
@@ -177,14 +177,14 @@ load test_helper
   login_wr acme "$A1"
   login_tok acme "$A1"
   run "$CFA" whoami acme
-  [[ "$output" == *"OAuth login (access token expires 2030-01-01"* ]]
-  [[ "$output" == *"+ API token (takes precedence)"* ]]
-  [[ "$output" != *SECRET* ]]
-  [[ "$output" != *TOKEN-acme* ]]
+  [[ "$output" == *"OAuth login (access token expires 2030-01-01"* ]] || false
+  [[ "$output" == *"+ API token (takes precedence)"* ]] || false
+  [[ "$output" != *SECRET* ]] || false
+  [[ "$output" != *TOKEN-acme* ]] || false
   run "$CFA" list
-  [[ "${lines[1]}" == "* acme"*"$A1"*"wrangler,token"*"yes" ]]
+  [[ "${lines[1]}" == "* acme"*"$A1"*"wrangler,token"*"yes" ]] || false
   run "$CFA" list --json
-  [[ "$output" != *TOKEN-acme* ]]
+  [[ "$output" != *TOKEN-acme* ]] || false
 }
 
 @test "doctor flags legacy ~/.wrangler and unmanaged global logins" {
@@ -193,14 +193,30 @@ load test_helper
   mkdir -p "$(dirname "$WCFG")"
   printf 'refresh_token = "x"\n' > "$WCFG"
   run "$CFA" doctor
-  [[ "$output" == *"not managed by cfa (adopt it: cfa import <name> wrangler)"* ]]
+  [[ "$output" == *"not managed by cfa (adopt it: cfa import <name> wrangler)"* ]] || false
   mkdir -p "$HOME/.wrangler"
   run "$CFA" doctor
-  [[ "$output" == *".wrangler exists"* ]]
+  [[ "$output" == *".wrangler exists"* ]] || false
 }
 
 @test "login without a kind is an error when not interactive" {
   run "$CFA" login acme
   [ "$status" -eq 2 ]
-  [[ "$output" == *"wrangler|token|cloudflared"* ]]
+  [[ "$output" == *"wrangler|token|cloudflared"* ]] || false
+}
+
+@test "doctor explains when the default isn't active for wrangler" {
+  mkdir -p "$(dirname "$WCFG")"
+  printf 'refresh_token = "old"\n' > "$WCFG"
+  login_wr it "$A1"
+  run "$CFA" doctor
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"default 'it' is not active for wrangler"* ]] || false
+  [[ "$output" == *"then: cfa default it"* ]] || false
+  # after dropping the old login, setting the default links it
+  rm "$WCFG"
+  "$CFA" -q default it
+  [ "$(readlink "$WCFG")" = "$STORE/it/xdg/.wrangler/config/default.toml" ]
+  run "$CFA" doctor
+  [[ "$output" != *"not active"* ]] || false
 }

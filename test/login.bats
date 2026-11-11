@@ -10,7 +10,7 @@ load test_helper
   [ "$(mode "$STORE")" = 700 ]
   [ "$(readlink "$HOME/.cloudflared/cert.pem")" = "$STORE/work/cert.pem" ]
   [ "$(cat "$STORE/work/account_id")" = aaaa1111 ]
-  [[ "$output" == *"default account"* ]]
+  [[ "$output" == *"default account"* ]] || false
 }
 
 @test "second login keeps the first account as default" {
@@ -76,14 +76,14 @@ load test_helper
   login work aaaa1111
   run env FAKE_CF_ACCOUNT=aaaa1111 "$CFA" login work2 cloudflared
   [ "$status" -eq 0 ]
-  [[ "$output" == *"same Cloudflare account as 'work'"* ]]
+  [[ "$output" == *"same Cloudflare account as 'work'"* ]] || false
 }
 
 @test "login respects the lock" {
   mkdir -p "$STORE/.lock"
   run env FAKE_CF_ACCOUNT=a "$CFA" login work cloudflared
   [ "$status" -eq 1 ]
-  [[ "$output" == *"in progress"* ]]
+  [[ "$output" == *"in progress"* ]] || false
 }
 
 @test "login without cloudflared fails clearly" {

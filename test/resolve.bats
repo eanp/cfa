@@ -52,7 +52,7 @@ setup_accounts() {
   setup_accounts
   CFA_ACCOUNT=none run "$CFA" current
   [ "$status" -eq 1 ]
-  [[ "$output" == "none"* ]]
+  [[ "$output" == "none"* ]] || false
 }
 
 @test "external TUNNEL_ORIGIN_CERT is reported, not overridden" {
@@ -69,7 +69,7 @@ setup_accounts() {
   echo ghost > .cfa-account
   run "$CFA" current
   [ "$status" -eq 4 ]
-  [[ "$output" == *"does not exist"* ]]
+  [[ "$output" == *"does not exist"* ]] || false
   run "$CFA" exec -- true
   [ "$status" -eq 4 ]
 }
@@ -111,7 +111,7 @@ setup_accounts() {
   setup_accounts
   run "$CFA" each -- cloudflared tunnel list
   [ "$status" -eq 0 ]
-  [[ "$output" == *"==> client"*"cert=$STORE/client/cert.pem"*"==> personal"*"==> work"* ]]
+  [[ "$output" == *"==> client"*"cert=$STORE/client/cert.pem"*"==> personal"*"==> work"* ]] || false
   run "$CFA" each -- false
   [ "$status" -eq 1 ]
 }
@@ -120,7 +120,7 @@ setup_accounts() {
   setup_accounts
   run "$CFA" use personal
   [ "$status" -eq 3 ]
-  [[ "$output" == *"cfa init"* ]]
+  [[ "$output" == *"cfa init"* ]] || false
 }
 
 @test "use --print emits shell code" {

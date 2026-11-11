@@ -92,7 +92,10 @@ check_shell() {
   f() { fish --no-config -c "$CFA init fish | source; $1"; }
   run f 'echo "$TUNNEL_ORIGIN_CERT|$_CFA_NAME"'
   [ "$output" = "$STORE/work/cert.pem|work" ]
-  run f 'cfa use personal 2>/dev/null; echo $TUNNEL_ORIGIN_CERT; cfa use --clear 2>/dev/null; echo $TUNNEL_ORIGIN_CERT'
+  # fish doesn't apply a function call's 2>/dev/null to command substitutions inside it,
+  # so drop the shell's stderr as a whole (inside the function: `run` merges stderr).
+  fq() { f "$1" 2>/dev/null; }
+  run fq 'cfa use personal; echo $TUNNEL_ORIGIN_CERT; cfa use --clear; echo $TUNNEL_ORIGIN_CERT'
   [ "${lines[0]}" = "$STORE/personal/cert.pem" ]
   [ "${lines[1]}" = "$STORE/work/cert.pem" ]
   run f "cd '$WORK/pinned/sub'; echo \$TUNNEL_ORIGIN_CERT"
@@ -171,7 +174,7 @@ check_wrangler_shell() {
 
   # opting out of the wrapper
   run "$sh" -c "CFA_NO_WRANGLER_WRAPPER=1; export CFA_NO_WRANGLER_WRAPPER; eval \"\$('$CFA' init $sh)\"; type wrangler"
-  [[ "$output" != *function* ]]
+  [[ "$output" != *function* ]] || false
 }
 
 @test "bash hook: wrangler" {

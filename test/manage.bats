@@ -10,7 +10,7 @@ load test_helper
   [ "$(mode "$STORE/work/cert.pem")" = 600 ]
   run "$CFA" import again
   [ "$status" -eq 1 ]
-  [[ "$output" == *"already managed"* ]]
+  [[ "$output" == *"already managed"* ]] || false
 }
 
 @test "import --copy from another path leaves the source alone" {
@@ -35,10 +35,10 @@ load test_helper
   login personal bbbb2222
   run "$CFA" list
   [ "$status" -eq 0 ]
-  [[ "${lines[1]}" == "  personal"*"bbbb2222"*"cloudflared"* ]]
-  [[ "${lines[2]}" == "* work"*"aaaa1111"*"cloudflared"*"yes" ]]
+  [[ "${lines[1]}" == "  personal"*"bbbb2222"*"cloudflared"* ]] || false
+  [[ "${lines[2]}" == "* work"*"aaaa1111"*"cloudflared"*"yes" ]] || false
   CFA_ACCOUNT=personal run "$CFA" list
-  [[ "${lines[1]}" == "* personal"* ]]
+  [[ "${lines[1]}" == "* personal"* ]] || false
 }
 
 @test "list --json" {
@@ -51,7 +51,7 @@ load test_helper
 @test "list with no accounts" {
   run "$CFA" list
   [ "$status" -eq 0 ]
-  [[ "$output" == *"No accounts yet"* ]]
+  [[ "$output" == *"No accounts yet"* ]] || false
 }
 
 @test "remove deletes the account and the default link" {
@@ -113,7 +113,7 @@ load test_helper
   mkcert "$HOME/.cloudflared/cert.pem" real
   run "$CFA" default work
   [ "$status" -eq 1 ]
-  [[ "$output" == *"cfa import"* ]]
+  [[ "$output" == *"cfa import"* ]] || false
   [ ! -L "$HOME/.cloudflared/cert.pem" ]
 }
 
@@ -123,11 +123,11 @@ load test_helper
   [ "$output" = "$STORE/work" ]
   run "$CFA" whoami
   [ "$status" -eq 0 ]
-  [[ "$output" == *"aaaa1111"* ]]
-  [[ "$output" == *"selected by default"* ]]
-  [[ "$output" != *SECRET* ]]
+  [[ "$output" == *"aaaa1111"* ]] || false
+  [[ "$output" == *"selected by  default"* ]] || false
+  [[ "$output" != *SECRET* ]] || false
   run "$CFA" list --json
-  [[ "$output" != *SECRET* ]]
+  [[ "$output" != *SECRET* ]] || false
 }
 
 @test "map node set, list, unset; requires existing account" {
@@ -148,7 +148,7 @@ load test_helper
   login work aaaa1111
   run "$CFA" doctor
   [ "$status" -eq 0 ]
-  [[ "$output" == *"no problems"* ]]
+  [[ "$output" == *"no problems"* ]] || false
 }
 
 @test "doctor reports problems" {
@@ -159,9 +159,9 @@ load test_helper
   printf 'origincert: /x/cert.pem\n' > "$HOME/.cloudflared/config.yml"
   run "$CFA" doctor
   [ "$status" -eq 1 ]
-  [[ "$output" == *"cert mode 644"* ]]
-  [[ "$output" == *"broken: cloudflared cert can't be decoded"* ]]
-  [[ "$output" == *"origincert:"* ]]
+  [[ "$output" == *"cert mode 644"* ]] || false
+  [[ "$output" == *"broken: cloudflared cert can't be decoded"* ]] || false
+  [[ "$output" == *"origincert:"* ]] || false
 }
 
 @test "unknown command and help" {
@@ -169,7 +169,7 @@ load test_helper
   [ "$status" -eq 2 ]
   run "$CFA" help
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Selection order"* ]]
+  [[ "$output" == *"Selection order"* ]] || false
   run "$CFA" --version
-  [[ "$output" == "cfa "* ]]
+  [[ "$output" == "cfa "* ]] || false
 }

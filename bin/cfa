@@ -1298,7 +1298,13 @@ cmd_doctor() {
   if is_ours "$wcfg"; then
     [ -e "$wcfg" ] || d_err "wrangler global login is a broken symlink: $(tilde "$wcfg")"
   elif [ -e "$wcfg" ]; then
-    d_warn "wrangler global login $(tilde "$wcfg") is not managed by cfa (adopt it: cfa import <name> wrangler)"
+    if [ -n "$def" ] && has_oauth "$def"; then
+      d_err "default '$def' is not active for wrangler: $(tilde "$wcfg") is an older login cfa doesn't manage, so plain wrangler/npx still use it"
+      printf '      fix: keep it as an account → cfa import <name> wrangler\n'
+      printf '           or drop it          → wrangler logout   (revokes it), then: cfa default %s\n' "$def"
+    else
+      d_warn "wrangler global login $(tilde "$wcfg") is not managed by cfa (adopt it: cfa import <name> wrangler)"
+    fi
   fi
   if is_ours "$CF_CERT"; then
     [ -e "$CF_CERT" ] || d_err "cloudflared default cert is a broken symlink"
