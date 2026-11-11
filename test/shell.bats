@@ -202,3 +202,17 @@ check_wrangler_shell() {
   run f "set -gx CLOUDFLARE_API_TOKEN from-direnv; cd '$WORK/ci'; _cfa_sync; $show"
   [ "$output" = "from-direnv||" ]
 }
+
+@test "hook falls back to cfa on PATH when the recorded binary is gone" {
+  setup_accounts
+  for sh in bash zsh; do
+    command -v "$sh" >/dev/null || continue
+    run "$sh" -c "eval \"\$('$CFA' init $sh)\"; _CFA_BIN=/nonexistent/cfa; cfa --version; cfa use personal 2>/dev/null; echo \"\$TUNNEL_ORIGIN_CERT\""
+    [ "${lines[0]}" = "$("$CFA" --version)" ]
+    [ "${lines[1]}" = "$STORE/personal/cert.pem" ]
+  done
+  if command -v fish >/dev/null; then
+    run fish --no-config -c "$CFA init fish | source; set _CFA_BIN /nonexistent/cfa; cfa --version"
+    [ "$output" = "$("$CFA" --version)" ]
+  fi
+}

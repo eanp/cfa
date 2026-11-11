@@ -167,16 +167,26 @@ _cfa_sync() {
   fi
 }
 
+# Run the cfa binary. Falls back to PATH if the one recorded at init time is
+# gone (e.g. switched from install.sh to Homebrew in an open shell).
+_cfa_bin() {
+  if [ -x "${_CFA_BIN-}" ]; then
+    "$_CFA_BIN" "$@"
+  else
+    command cfa "$@"
+  fi
+}
+
 cfa() {
   local _cfa_out _cfa_rc
   if [ "${1-}" = use ]; then
     shift
-    _cfa_out=$("$_CFA_BIN" use --print --shell sh "$@") || return $?
+    _cfa_out=$(_cfa_bin use --print --shell sh "$@") || return $?
     eval "$_cfa_out"
     _cfa_sync
     return 0
   fi
-  "$_CFA_BIN" "$@"
+  _cfa_bin "$@"
   _cfa_rc=$?
   _cfa_sync
   return $_cfa_rc
@@ -1556,18 +1566,27 @@ function _cfa_sync --on-event fish_prompt --on-variable PWD
     end
 end
 
+# Falls back to PATH if the binary recorded at init time is gone.
+function _cfa_bin
+    if test -x "$_CFA_BIN"
+        $_CFA_BIN $argv
+    else
+        command cfa $argv
+    end
+end
+
 function cfa --description 'Cloudflare account switcher for wrangler and cloudflared'
     if test (count $argv) -ge 1; and test "$argv[1]" = use
         set -l rest $argv
         set -e rest[1]
-        set -l out ($_CFA_BIN use --print --shell fish $rest); or return $status
+        set -l out (_cfa_bin use --print --shell fish $rest); or return $status
         for line in $out
             eval $line
         end
         _cfa_sync
         return 0
     end
-    $_CFA_BIN $argv
+    _cfa_bin $argv
     set -l rc $status
     _cfa_sync
     return $rc

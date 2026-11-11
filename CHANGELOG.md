@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The shell hook falls back to `cfa` on `PATH` when the binary recorded by `cfa init`
+  no longer exists (e.g. after switching from `install.sh` to Homebrew in an open shell).
+
 ## [0.1.0] - 2026-11-12
 
 ### Added
