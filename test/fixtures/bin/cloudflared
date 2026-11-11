@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Fake cloudflared used by the test suite. Never talks to the network.
+#
+#   FAKE_CF_ACCOUNT  account ID to put in the cert written by `tunnel login`
+#   FAKE_CF_FAIL     make `tunnel login` fail without writing anything
+#   FAKE_CF_FAIL_AFTER_WRITE  write the cert, then fail
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=../mkcert.sh
+. "$here/../mkcert.sh"
+
+case "${1-} ${2-}" in
+  "tunnel login")
+    printf '%s\n' "${TUNNEL_ORIGIN_CERT-<unset>}" > "$HOME/.fake-login-env"
+    if [ -n "${FAKE_CF_FAIL-}" ]; then
+      echo "Failed to login" >&2
+      exit 1
+    fi
+    if [ -e "$HOME/.cloudflared/cert.pem" ]; then
+      echo "You have an existing certificate at $HOME/.cloudflared/cert.pem which login would overwrite." >&2
+      exit 1
+    fi
+    mkdir -p "$HOME/.cloudflared"
+    mkcert "$HOME/.cloudflared/cert.pem" "${FAKE_CF_ACCOUNT:-acc0000000000000000000000000000000}"
+    [ -z "${FAKE_CF_FAIL_AFTER_WRITE-}" ] || exit 1
+    echo "You have successfully logged in."
+    ;;
+  "--version "*)
+    echo "cloudflared version 2026.8.2 (fake)"
+    ;;
+  *)
+    echo "cert=${TUNNEL_ORIGIN_CERT-<unset>}"
+    ;;
+esac

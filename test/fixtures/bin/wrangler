@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Fake wrangler used by the test suite. Never talks to the network.
+# Mirrors wrangler's config-path logic and writes through symlinks like
+# Node's writeFileSync does.
+#
+#   FAKE_WR_ACCOUNTS  comma-separated account IDs the login / API token can see
+#   FAKE_WR_FAIL      make `login` fail
+set -eu
+
+cfg_dir() {
+  if [ -d "$HOME/.wrangler" ]; then
+    echo "$HOME/.wrangler"
+  elif [ -n "${XDG_CONFIG_HOME-}" ]; then
+    echo "$XDG_CONFIG_HOME/.wrangler"
+  elif [ "$(uname -s)" = Darwin ]; then
+    echo "$HOME/Library/Preferences/.wrangler"
+  else
+    echo "$HOME/.config/.wrangler"
+  fi
+}
+cfg="$(cfg_dir)/config/default.toml"
+
+table() {
+  echo "┌──────────────┬──────────────────────────────────┐"
+  echo "│ Account Name │ Account ID                       │"
+  echo "├──────────────┼──────────────────────────────────┤"
+  for id in $(printf '%s' "$1" | tr ',' ' '); do
+    echo "│ Acct ${id:0:4}    │ $id │"
+  done
+  echo "└──────────────┴──────────────────────────────────┘"
+}
+
+case "${1-}" in
+  login)
+    printf '%s|%s\n' "${XDG_CONFIG_HOME-<unset>}" "${CLOUDFLARE_API_TOKEN-<unset>}" > "$HOME/.fake-wrangler-login-env"
+    if [ -n "${CLOUDFLARE_API_TOKEN-}" ]; then
+      echo "You are logged in with an API Token. Unset the CLOUDFLARE_API_TOKEN in the environment to log in via OAuth." >&2
+      exit 1
+    fi
+    if [ -n "${FAKE_WR_FAIL-}" ]; then
+      echo "Login failed" >&2
+      exit 1
+    fi
+    mkdir -p "$(dirname "$cfg")"
+    printf 'oauth_token = "SECRET-OAUTH"\nexpiration_time = "2030-01-01T00:00:00.000Z"\nrefresh_token = "SECRET-REFRESH"\n# fake_accounts = %s\n' \
+      "${FAKE_WR_ACCOUNTS-}" > "$cfg"
+    echo "Successfully logged in."
+    ;;
+  whoami)
+    if [ -n "${CLOUDFLARE_API_TOKEN-}" ]; then
+      echo "You are logged in with an User API Token."
+      table "${FAKE_WR_ACCOUNTS-}"
+    elif [ -f "$cfg" ]; then
+      echo "You are logged in with an OAuth Token, associated with the email x@example.com."
+      table "$(sed -n 's/^# fake_accounts = //p' "$cfg")"
+    else
+      echo "You are not authenticated. Please run \`wrangler login\`."
+    fi
+    ;;
+  logout)
+    if [ -f "$cfg" ]; then
+      rm -f "$cfg"
+      echo "Wrangler is configured with an OAuth token. The token has been successfully revoked"
+    else
+      echo "Not logged in, exiting..."
+    fi
+    ;;
+  *)
+    echo "token=${CLOUDFLARE_API_TOKEN-<unset>} account=${CLOUDFLARE_ACCOUNT_ID-<unset>} xdg=${XDG_CONFIG_HOME-<unset>}"
+    ;;
+esac

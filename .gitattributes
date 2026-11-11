@@ -1,0 +1,3 @@
+* text=auto eol=lf
+*.bats linguist-language=Shell
+bin/cfa linguist-language=Shell

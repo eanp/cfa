@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea discussion
+    url: https://github.com/eanp/cfa/discussions
+    about: Ask how to do something or discuss an idea before opening an issue.
+  - name: Report a security vulnerability
+    url: https://github.com/eanp/cfa/security/advisories/new
+    about: Please report security issues privately.

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: make lint
+
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.bash }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bash: bash 5
+          - os: macos-latest
+            bash: bash 3.2
+            test_bash: /bin/bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bats zsh fish
+      - name: Install test dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bats-core fish
+      - name: Run tests
+        env:
+          CFA_TEST_BASH: ${{ matrix.test_bash }}
+        run: |
+          if [ -n "$CFA_TEST_BASH" ]; then "$CFA_TEST_BASH" --version | head -n1; fi
+          bats --print-output-on-failure test
+
+  install-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make install into a staging dir
+        run: |
+          make install DESTDIR="$RUNNER_TEMP/stage" PREFIX=/usr
+          "$RUNNER_TEMP/stage/usr/bin/cfa" --version
+          test -s "$RUNNER_TEMP/stage/usr/share/zsh/site-functions/_cfa"

@@ -1,0 +1,7 @@
+# private design notes
+based
+
+# local test/dev artifacts
+.cfa-account
+*.cfa-backup.*
+.DS_Store

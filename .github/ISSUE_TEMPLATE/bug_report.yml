@@ -1,0 +1,53 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Never paste credentials** — not a `cert.pem`, a wrangler `default.toml`, or an API token.
+        Security issues: please use *Security → Report a vulnerability* instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. cfa login a
+        2. cd project && cfa pin a
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `cfa doctor`
+      description: Account IDs are not secret, but you may redact them.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: tools
+    attributes:
+      label: wrangler / cloudflared versions
+      placeholder: wrangler 4.35.0, cloudflared 2026.8.2
+  - type: input
+    id: shell
+    attributes:
+      label: Shell and version
+      placeholder: zsh 5.9
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: macOS 15.1 / Ubuntu 24.04 / WSL
+    validations:
+      required: true

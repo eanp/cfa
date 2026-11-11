@@ -1,0 +1,1759 @@
+#!/usr/bin/env bash
+# cfa — use several Cloudflare accounts with `wrangler` and `cloudflared`.
+#
+# Stores one set of credentials per Cloudflare account (wrangler OAuth login,
+# wrangler API token, cloudflared origin cert) and selects an account per
+# command, per shell, per directory, or machine-wide.
+#
+# SPDX-License-Identifier: MIT
+# Requires: bash >= 3.2. wrangler and/or cloudflared only for logging in.
+
+set -euo pipefail
+umask 077
+
+CFA_VERSION="0.1.0"
+CFA_URL="https://github.com/eanp/cfa"
+
+CF_DIR="$HOME/.cloudflared"
+CF_CERT="$CF_DIR/cert.pem"
+H="${CFA_HOME:-$HOME/.config/cfa}"
+QUIET=0
+
+# Relative paths of credentials inside an account directory.
+OAUTH_REL="xdg/.wrangler/config/default.toml"
+
+# ---------------------------------------------------------------------------
+# Shell-portable core (bash + zsh). This exact code is also emitted by
+# `cfa init bash|zsh`, so the prompt hook resolves accounts without forking.
+# Keep it POSIX-ish: no arrays, no [[ ]], no bash-only expansions.
+# ---------------------------------------------------------------------------
+read -r -d '' CFA_SH_CORE <<'CORE' || true
+_cfa_valid_name() {
+  case "$1" in
+    # explicit sets: [a-z] ranges match uppercase in some locales
+    ''|default|none|[!abcdefghijklmnopqrstuvwxyz0123456789]*) return 1 ;;
+    *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*) return 1 ;;
+  esac
+  [ "${#1}" -le 32 ]
+}
+
+# Sets _cfa_name, _cfa_src and _cfa_h. Returns 1 when nothing resolves.
+# Precedence: CFA_ACCOUNT > .cfa-account (nearest parent) > node mapping > default.
+_cfa_resolve() {
+  local _d _line _v
+  _cfa_name=''
+  _cfa_src=''
+  _cfa_h=${CFA_HOME:-$HOME/.config/cfa}
+
+  if [ -n "${CFA_ACCOUNT-}" ]; then
+    _cfa_name=$CFA_ACCOUNT
+    _cfa_src='shell (cfa use)'
+    return 0
+  fi
+
+  if [ -z "${CFA_NO_DIR-}" ]; then
+    _d=${PWD-}
+    while :; do
+      if [ -f "$_d/.cfa-account" ]; then
+        _line=''
+        IFS= read -r _line < "$_d/.cfa-account" || :
+        _cfa_name=${_line%%[[:space:]]*}
+        _cfa_src="pin $_d/.cfa-account"
+        return 0
+      fi
+      [ -z "$_d" ] && break
+      _d=${_d%/*}
+    done
+  fi
+
+  if [ -n "${NVM_BIN-}" ] && [ -f "$_cfa_h/config" ]; then
+    _v=${NVM_BIN%/bin}
+    _v=${_v##*/}
+    _v=${_v#v}
+    _v=${_v%%.*}
+    if [ -n "$_v" ]; then
+      while IFS= read -r _line || [ -n "$_line" ]; do
+        case "$_line" in
+          "node.$_v="*)
+            _cfa_name=${_line#*=}
+            _cfa_src="node v$_v mapping"
+            return 0
+            ;;
+        esac
+      done < "$_cfa_h/config"
+    fi
+  fi
+
+  if [ -f "$_cfa_h/default" ]; then
+    _line=''
+    IFS= read -r _line < "$_cfa_h/default" || :
+    if [ -n "$_line" ]; then
+      _cfa_name=$_line
+      _cfa_src='default'
+      return 0
+    fi
+  fi
+  return 1
+}
+CORE
+_cfa_name='' _cfa_src='' _cfa_h=''
+eval "$CFA_SH_CORE"
+
+# Hook-side code (bash + zsh); emitted by `cfa init`.
+read -r -d '' CFA_SH_HOOK <<'HOOK' || true
+# Re-resolve the account and export what cloudflared / wrangler read.
+# Values cfa did not export itself (direnv, CI, manual export) are left alone.
+# A selected account that is missing or lacks a credential still gets
+# exported paths/IDs, so the tools fail instead of using another account.
+_cfa_sync() {
+  local _a _tok _id _fp
+  _a=''
+  _CFA_NAME=''
+  if _cfa_resolve && [ "$_cfa_name" != none ]; then
+    if _cfa_valid_name "$_cfa_name"; then
+      _a="$_cfa_h/$_cfa_name"
+      _CFA_NAME=$_cfa_name
+      [ -d "$_a" ] || _CFA_NAME="$_cfa_name?"
+    else
+      _a="$_cfa_h/.invalid-account-name"
+      _CFA_NAME='invalid?'
+    fi
+  fi
+
+  # cloudflared
+  if [ -n "${TUNNEL_ORIGIN_CERT-}" ] && [ "$TUNNEL_ORIGIN_CERT" != "${_CFA_EXPORTED-}" ]; then
+    :
+  elif [ -n "$_a" ]; then
+    _CFA_EXPORTED="$_a/cert.pem"
+    TUNNEL_ORIGIN_CERT=$_CFA_EXPORTED
+    export TUNNEL_ORIGIN_CERT _CFA_EXPORTED
+  else
+    unset TUNNEL_ORIGIN_CERT _CFA_EXPORTED
+  fi
+
+  # wrangler
+  _fp=''
+  [ -n "${CLOUDFLARE_API_TOKEN-}" ] && _fp="${#CLOUDFLARE_API_TOKEN}:${CLOUDFLARE_API_TOKEN#"${CLOUDFLARE_API_TOKEN%??????}"}"
+  if { [ -n "${CLOUDFLARE_API_TOKEN-}" ] && [ "$_fp" != "${_CFA_TOKEN_FP-}" ]; } ||
+    { [ -n "${CLOUDFLARE_ACCOUNT_ID-}" ] && [ "$CLOUDFLARE_ACCOUNT_ID" != "${_CFA_ACCOUNT_ID-}" ]; }; then
+    # Set outside cfa: drop whatever half we exported so they don't mix.
+    [ -n "${CLOUDFLARE_API_TOKEN-}" ] && [ "$_fp" = "${_CFA_TOKEN_FP-}" ] && unset CLOUDFLARE_API_TOKEN
+    [ -n "${CLOUDFLARE_ACCOUNT_ID-}" ] && [ "$CLOUDFLARE_ACCOUNT_ID" = "${_CFA_ACCOUNT_ID-}" ] && unset CLOUDFLARE_ACCOUNT_ID
+    unset _CFA_TOKEN_FP _CFA_ACCOUNT_ID _CFA_WRANGLER_XDG
+  elif [ -n "$_a" ]; then
+    _tok=''
+    [ -f "$_a/token" ] && { IFS= read -r _tok < "$_a/token" || :; }
+    if [ -n "$_tok" ]; then
+      CLOUDFLARE_API_TOKEN=$_tok
+      _CFA_TOKEN_FP="${#_tok}:${_tok#"${_tok%??????}"}"
+      export CLOUDFLARE_API_TOKEN _CFA_TOKEN_FP
+    else
+      unset CLOUDFLARE_API_TOKEN _CFA_TOKEN_FP
+    fi
+    _id=''
+    [ -f "$_a/account_id" ] && { IFS= read -r _id < "$_a/account_id" || :; }
+    [ -n "$_id" ] || _id='cfa-no-account-id'
+    CLOUDFLARE_ACCOUNT_ID=$_id
+    _CFA_ACCOUNT_ID=$_id
+    export CLOUDFLARE_ACCOUNT_ID _CFA_ACCOUNT_ID
+    if [ -f "$_a/xdg/.wrangler/config/default.toml" ]; then
+      _CFA_WRANGLER_XDG="$_a/xdg"
+      export _CFA_WRANGLER_XDG
+    else
+      unset _CFA_WRANGLER_XDG
+    fi
+  else
+    unset CLOUDFLARE_API_TOKEN _CFA_TOKEN_FP CLOUDFLARE_ACCOUNT_ID _CFA_ACCOUNT_ID _CFA_WRANGLER_XDG
+  fi
+}
+
+cfa() {
+  local _cfa_out _cfa_rc
+  if [ "${1-}" = use ]; then
+    shift
+    _cfa_out=$("$_CFA_BIN" use --print --shell sh "$@") || return $?
+    eval "$_cfa_out"
+    _cfa_sync
+    return 0
+  fi
+  "$_CFA_BIN" "$@"
+  _cfa_rc=$?
+  _cfa_sync
+  return $_cfa_rc
+}
+HOOK
+
+# Optional wrapper: lets plain `wrangler` use the selected account's OAuth login.
+read -r -d '' CFA_SH_WRANGLER <<'WRAP' || true
+wrangler() {
+  if [ -n "${_CFA_WRANGLER_XDG-}" ] && [ -z "${CLOUDFLARE_API_TOKEN-}" ]; then
+    XDG_CONFIG_HOME=$_CFA_WRANGLER_XDG command wrangler "$@"
+  else
+    command wrangler "$@"
+  fi
+}
+WRAP
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+C_RED='' C_GRN='' C_YLW='' C_DIM='' C_BLD='' C_OFF=''
+setup_color() {
+  if [ -t 2 ] && [ -z "${NO_COLOR-}" ] && [ "${TERM-}" != dumb ]; then
+    C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YLW=$'\033[33m'
+    C_DIM=$'\033[2m' C_BLD=$'\033[1m' C_OFF=$'\033[0m'
+  fi
+}
+
+die() { # die <exit-code> <message...>
+  local code=$1
+  shift
+  printf '%scfa:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2
+  exit "$code"
+}
+info() { [ "$QUIET" = 1 ] || printf '%s\n' "$*" >&2; }
+ok() { [ "$QUIET" = 1 ] || printf '%s✓%s %s\n' "$C_GRN" "$C_OFF" "$*" >&2; }
+warn() { printf '%s!%s %s\n' "$C_YLW" "$C_OFF" "$*" >&2; }
+
+# Single-quote a string for safe re-use in sh/zsh/fish source.
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+sq_fish() { printf "'%s'" "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")"; }
+
+pretty_src() { # "pin /x/.cfa-account" -> "pin ~/x/.cfa-account"
+  case "$1" in
+    "pin "*) printf 'pin %s' "$(tilde "${1#pin }")" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+tilde() { # pretty-print a path relative to $HOME
+  # shellcheck disable=SC2088 # a literal "~" is the point here
+  case "$1" in
+    "$HOME") printf '~' ;;
+    "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+is_tty() { [ -r /dev/tty ] && [ -t 0 ] && [ -z "${CFA_NONINTERACTIVE-}" ]; }
+
+# ---------------------------------------------------------------------------
+# Store
+# ---------------------------------------------------------------------------
+ensure_home() {
+  mkdir -p "$H"
+  chmod 700 "$H"
+}
+
+acct_dir() { printf '%s/%s' "$H" "$1"; }
+acct_cert() { printf '%s/%s/cert.pem' "$H" "$1"; }
+acct_token() { printf '%s/%s/token' "$H" "$1"; }
+acct_xdg() { printf '%s/%s/xdg' "$H" "$1"; }
+acct_oauth() { printf '%s/%s/%s' "$H" "$1" "$OAUTH_REL"; }
+
+has_cert() { [ -f "$(acct_cert "$1")" ]; }
+has_token() { [ -s "$(acct_token "$1")" ]; }
+has_oauth() { [ -f "$(acct_oauth "$1")" ]; }
+acct_exists() { has_cert "$1" || has_token "$1" || has_oauth "$1"; }
+
+acct_kinds() { # space-separated list of credential kinds
+  local k=''
+  has_oauth "$1" && k="$k wrangler"
+  has_token "$1" && k="$k token"
+  has_cert "$1" && k="$k cloudflared"
+  printf '%s' "${k# }"
+}
+
+account_id() { # account_id <name>
+  local f id=''
+  f="$(acct_dir "$1")/account_id"
+  [ -f "$f" ] && { IFS= read -r id < "$f" || true; }
+  printf '%s' "$id"
+}
+set_account_id() { # set_account_id <name> <id>
+  printf '%s\n' "$2" > "$(acct_dir "$1")/account_id.tmp"
+  mv -f "$(acct_dir "$1")/account_id.tmp" "$(acct_dir "$1")/account_id"
+}
+
+require_valid() {
+  _cfa_valid_name "$1" || die 2 "invalid account name '$1' (use a-z, 0-9, '-', '_'; max 32; not 'default' or 'none')"
+}
+require_exists() {
+  require_valid "$1"
+  acct_exists "$1" || die 4 "no account named '$1' (see: cfa list)"
+}
+
+new_acct_dir() { # create (if needed) an account dir with safe permissions
+  ensure_home
+  mkdir -p "$(acct_dir "$1")"
+  chmod 700 "$(acct_dir "$1")"
+  if [ ! -f "$(acct_dir "$1")/meta" ]; then
+    printf 'created=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$(acct_dir "$1")/meta"
+  fi
+}
+
+accounts() { # prints one account name per line, sorted
+  local d n
+  [ -d "$H" ] || return 0
+  for d in "$H"/*/; do
+    [ -d "$d" ] || continue
+    n=${d%/}
+    n=${n##*/}
+    _cfa_valid_name "$n" || continue
+    acct_exists "$n" || continue
+    printf '%s\n' "$n"
+  done
+}
+
+default_name() { # prints the default account name
+  local n=''
+  [ -f "$H/default" ] || return 1
+  IFS= read -r n < "$H/default" || true
+  [ -n "$n" ] || return 1
+  printf '%s' "$n"
+}
+
+file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+
+# Where wrangler keeps its global OAuth login (mirrors wrangler's own logic).
+wrangler_cfg() {
+  if [ -d "$HOME/.wrangler" ]; then
+    printf '%s/.wrangler/config/default.toml' "$HOME"
+  elif [ -n "${XDG_CONFIG_HOME-}" ]; then
+    printf '%s/.wrangler/config/default.toml' "$XDG_CONFIG_HOME"
+  elif [ "$(uname -s)" = Darwin ]; then
+    printf '%s/Library/Preferences/.wrangler/config/default.toml' "$HOME"
+  else
+    printf '%s/.config/.wrangler/config/default.toml' "$HOME"
+  fi
+}
+
+is_ours() { # is_ours <path>: a symlink into the cfa store
+  local t
+  [ -L "$1" ] || return 1
+  t=$(readlink "$1")
+  case "$t" in "$H"/*) return 0 ;; *) return 1 ;; esac
+}
+
+# Atomically point a symlink at a target.
+atomic_symlink() { # atomic_symlink <target> <link>
+  local tmp="$2.cfa-tmp.$$"
+  mkdir -p "$(dirname "$2")"
+  ln -s "$1" "$tmp"
+  mv -f "$tmp" "$2"
+}
+
+# Make the machine-wide files match the default account: ~/.cloudflared/cert.pem
+# and wrangler's global default.toml become symlinks into the account, or are
+# removed if the account lacks that credential. Unmanaged real files are never
+# touched. Prints nothing; callers report.
+apply_default() {
+  local n wcfg
+  n=$(default_name || true)
+  wcfg=$(wrangler_cfg)
+  if [ -n "$n" ] && has_cert "$n"; then
+    if is_ours "$CF_CERT" || { [ ! -e "$CF_CERT" ] && [ ! -L "$CF_CERT" ]; }; then
+      atomic_symlink "$(acct_cert "$n")" "$CF_CERT"
+    fi
+  elif is_ours "$CF_CERT"; then
+    rm -f "$CF_CERT"
+  fi
+  if [ -n "$n" ] && has_oauth "$n"; then
+    if is_ours "$wcfg" || { [ ! -e "$wcfg" ] && [ ! -L "$wcfg" ]; }; then
+      atomic_symlink "$(acct_oauth "$n")" "$wcfg"
+    fi
+  elif is_ours "$wcfg"; then
+    rm -f "$wcfg"
+  fi
+  return 0
+}
+
+set_default() { # set_default <name|''>
+  ensure_home
+  if [ -n "$1" ]; then
+    printf '%s\n' "$1" > "$H/default.tmp"
+    mv -f "$H/default.tmp" "$H/default"
+  else
+    rm -f "$H/default"
+  fi
+  apply_default
+}
+
+LOCK=''
+take_lock() {
+  ensure_home
+  LOCK="$H/.lock"
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    LOCK=''
+    die 1 "another cfa operation is in progress (if not, remove $(tilde "$H/.lock"))"
+  fi
+}
+release_lock() {
+  if [ -n "$LOCK" ]; then
+    rmdir "$LOCK" 2>/dev/null || true
+    LOCK=''
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Credential decoding. cloudflared cert.pem files hold an "ARGO TUNNEL TOKEN"
+# PEM block with base64 JSON: {"zoneID","accountID","apiToken",...}. We only
+# ever extract the IDs; tokens are never printed.
+# ---------------------------------------------------------------------------
+B64D=''
+b64d() {
+  if [ -z "$B64D" ]; then
+    if printf 'YQ==' | base64 -d >/dev/null 2>&1; then B64D='-d'; else B64D='-D'; fi
+  fi
+  base64 "$B64D" 2>/dev/null
+}
+
+cert_field() { # cert_field <file> <jsonKey>
+  local b64 json
+  [ -r "$1" ] || return 1
+  b64=$(sed -n '/-----BEGIN ARGO TUNNEL TOKEN-----/,/-----END ARGO TUNNEL TOKEN-----/{/-----/d;p;}' "$1" | tr -d ' \t\r\n')
+  [ -n "$b64" ] || return 1
+  json=$(printf '%s' "$b64" | b64d) || return 1
+  # shellcheck disable=SC2020 # one char -> one newline, on purpose
+  printf '%s' "$json" | tr ',{}' '\n\n\n' |
+    sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n1
+}
+
+oauth_expiry() { # non-secret field from a wrangler OAuth file
+  sed -n 's/^expiration_time[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n1
+}
+
+# ---------------------------------------------------------------------------
+# External tools
+# ---------------------------------------------------------------------------
+need_cloudflared() {
+  CF_BIN=${CFA_CLOUDFLARED:-$(command -v cloudflared || true)}
+  [ -n "$CF_BIN" ] && [ -x "$CF_BIN" ] ||
+    die 6 "cloudflared not found (install: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)"
+}
+
+WR_CMD=()
+find_wrangler() { # sets WR_CMD or returns 1
+  if [ -n "${CFA_WRANGLER-}" ]; then
+    WR_CMD=("$CFA_WRANGLER")
+  elif command -v wrangler >/dev/null 2>&1; then
+    WR_CMD=("$(command -v wrangler)")
+  elif command -v npx >/dev/null 2>&1; then
+    WR_CMD=(npx --yes wrangler)
+    info "wrangler not on PATH; using npx wrangler"
+  else
+    return 1
+  fi
+}
+need_wrangler() {
+  find_wrangler || die 6 "wrangler not found (install: npm i -g wrangler)"
+}
+
+# Run wrangler with all ambient Cloudflare credentials removed.
+wr_clean() { # wr_clean [VAR=value...] -- args...
+  local envs=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
+  [ "${1-}" = -- ] && shift
+  env -u CLOUDFLARE_API_TOKEN -u CF_API_TOKEN -u CLOUDFLARE_API_KEY -u CLOUDFLARE_EMAIL \
+    -u CLOUDFLARE_ACCOUNT_ID -u CF_ACCOUNT_ID -u XDG_CONFIG_HOME \
+    ${envs[@]+"${envs[@]}"} "${WR_CMD[@]}" "$@"
+}
+
+# From `wrangler whoami` output, choose an account ID. Prints it or returns 1.
+choose_account_id() { # choose_account_id <whoami-output>
+  local rows n i=0 pick=''
+  rows=$(printf '%s\n' "$1" | LC_ALL=C grep -E '[0-9a-f]{32}' || true)
+  n=$(printf '%s' "$rows" | grep -c . || true)
+  if [ "$n" -eq 1 ]; then
+    printf '%s' "$rows" | LC_ALL=C grep -oE '[0-9a-f]{32}' | head -n1
+    return 0
+  fi
+  [ "$n" -gt 1 ] && is_tty || return 1
+  {
+    echo "This login can access several Cloudflare accounts. Which one is this cfa account?"
+    printf '%s\n' "$rows" | while IFS= read -r line; do
+      i=$((i + 1))
+      printf '  %d) %s\n' "$i" "$(printf '%s' "$line" | sed 's/[│|]/ /g; s/  */ /g; s/^ //')"
+    done
+    printf 'Number [1-%d]: ' "$n"
+  } > /dev/tty
+  IFS= read -r pick < /dev/tty || true
+  case "$pick" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pick" -ge 1 ] && [ "$pick" -le "$n" ] || return 1
+  printf '%s\n' "$rows" | sed -n "${pick}p" | LC_ALL=C grep -oE '[0-9a-f]{32}' | head -n1
+}
+
+# Record the account ID; refuse to mix two different Cloudflare accounts
+# under one name unless forced.
+record_account_id() { # record_account_id <name> <id> <force>
+  local cur
+  [ -n "$2" ] || return 0
+  cur=$(account_id "$1")
+  if [ -n "$cur" ] && [ "$cur" != "$2" ]; then
+    [ "$3" = 1 ] || die 1 "'$1' is Cloudflare account $cur, but this login is $2 (use another name, or --force)"
+    warn "'$1' changes from account $cur to $2"
+  fi
+  set_account_id "$1" "$2"
+}
+
+warn_duplicate() { # warn if another name has the same account ID
+  local other
+  [ -n "$2" ] || return 0
+  for other in $(accounts); do
+    [ "$other" = "$1" ] && continue
+    [ "$(account_id "$other")" = "$2" ] && warn "this is the same Cloudflare account as '$other' ($2)"
+  done
+  return 0
+}
+
+confirm() { # confirm <question>
+  local reply=''
+  [ -r /dev/tty ] || die 1 "cannot ask for confirmation (no tty); pass -y"
+  printf '%s [y/N] ' "$1" > /dev/tty
+  IFS= read -r reply < /dev/tty || true
+  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# Resolution helpers for commands
+# ---------------------------------------------------------------------------
+external_cert() {
+  [ -n "${TUNNEL_ORIGIN_CERT-}" ] && [ "$TUNNEL_ORIGIN_CERT" != "${_CFA_EXPORTED-}" ]
+}
+external_wrangler() {
+  local fp=''
+  [ -n "${CLOUDFLARE_API_TOKEN-}" ] && fp="${#CLOUDFLARE_API_TOKEN}:${CLOUDFLARE_API_TOKEN#"${CLOUDFLARE_API_TOKEN%??????}"}"
+  { [ -n "${CLOUDFLARE_API_TOKEN-}" ] && [ "$fp" != "${_CFA_TOKEN_FP-}" ]; } ||
+    { [ -n "${CLOUDFLARE_ACCOUNT_ID-}" ] && [ "$CLOUDFLARE_ACCOUNT_ID" != "${_CFA_ACCOUNT_ID-}" ]; }
+}
+
+# name_or_current [name] -> prints a valid, existing account name or dies.
+name_or_current() {
+  if [ -n "${1-}" ]; then
+    require_exists "$1"
+    printf '%s' "$1"
+    return 0
+  fi
+  if ! _cfa_resolve || [ "$_cfa_name" = none ]; then
+    die 1 "no account selected (try: cfa use <name>, cfa pin <name> or cfa default <name>)"
+  fi
+  _cfa_valid_name "$_cfa_name" || die 2 "invalid account name '$_cfa_name' from $(pretty_src "$_cfa_src")"
+  acct_exists "$_cfa_name" || die 4 "account '$_cfa_name' (from $(pretty_src "$_cfa_src")) does not exist"
+  printf '%s' "$_cfa_name"
+}
+
+# ---------------------------------------------------------------------------
+# login / import / logout
+# ---------------------------------------------------------------------------
+KINDS='wrangler token cloudflared'
+
+pick_kind() { # interactive choice when `cfa login <name>` has no kind
+  local pick=''
+  is_tty || die 2 "say what to log in to: cfa login <name> <wrangler|token|cloudflared>"
+  {
+    echo "What should '$1' log in to?"
+    echo "  1) wrangler     — OAuth in the browser (wrangler login)"
+    echo "  2) token        — paste a Cloudflare API token for wrangler"
+    echo "  3) cloudflared  — tunnel cert in the browser (cloudflared tunnel login)"
+    printf 'Number [1-3]: '
+  } > /dev/tty
+  IFS= read -r pick < /dev/tty || true
+  case "$pick" in
+    1) echo wrangler ;;
+    2) echo token ;;
+    3) echo cloudflared ;;
+    *) die 2 "no choice made" ;;
+  esac
+}
+
+cmd_login() {
+  local name='' kind='' force=0 acct_id=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force) force=1 ;;
+      --account-id) shift; acct_id=${1-} ;;
+      --account-id=*) acct_id=${1#--account-id=} ;;
+      --) shift; break ;;
+      -h|--help) usage_login; return 0 ;;
+      -*) die 2 "unknown option for login: $1" ;;
+      *)
+        if [ -z "$name" ]; then name=$1
+        elif [ -z "$kind" ]; then kind=$1
+        else die 2 "unexpected argument: $1"; fi
+        ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die 2 "usage: cfa login <name> [wrangler|token|cloudflared] [--account-id ID] [--force]"
+  require_valid "$name"
+  if [ -n "$acct_id" ]; then
+    case "$acct_id" in *[!0-9a-f]*|'') die 2 "--account-id must be a 32-character hex ID" ;; esac
+  fi
+  [ -n "$kind" ] || kind=$(pick_kind "$name")
+  case "$kind" in
+    wrangler) login_wrangler "$name" "$force" "$acct_id" "$@" ;;
+    token) login_token "$name" "$force" "$acct_id" ;;
+    cloudflared|tunnel) login_cloudflared "$name" "$force" "$@" ;;
+    *) die 2 "unknown login kind '$kind' (use: $KINDS)" ;;
+  esac
+  if ! default_name >/dev/null; then
+    set_default "$name"
+    ok "'$name' is now the default account"
+  elif [ "$(default_name)" = "$name" ]; then
+    apply_default
+  fi
+}
+
+login_wrangler() { # <name> <force> <account-id> [wrangler login args]
+  local name=$1 force=$2 id=$3 who
+  shift 3
+  if has_oauth "$name" && [ "$force" != 1 ]; then
+    die 5 "'$name' already has a wrangler login (use --force to replace it)"
+  fi
+  if [ -d "$HOME/.wrangler" ]; then
+    die 1 "$(tilde "$HOME/.wrangler") exists, which makes wrangler ignore per-account logins. Adopt it with: cfa import <name> wrangler"
+  fi
+  need_wrangler
+  take_lock
+  trap release_lock EXIT
+  new_acct_dir "$name"
+  local xdg tmp
+  xdg=$(acct_xdg "$name")
+  # Log in into a scratch dir first so a failed login can't clobber a good one.
+  tmp="$(acct_dir "$name")/.xdg-login.$$"
+  mkdir -p "$tmp"
+  info "Opening the Cloudflare login for '$name' — sign in with the right account in your browser."
+  if ! wr_clean "XDG_CONFIG_HOME=$tmp" -- login "$@" || [ ! -f "$tmp/.wrangler/config/default.toml" ]; then
+    rm -rf "$tmp"
+    acct_exists "$name" || rm -rf "$(acct_dir "$name")"
+    die 6 "wrangler login failed or was cancelled"
+  fi
+  if [ -z "$id" ]; then
+    who=$(wr_clean "XDG_CONFIG_HOME=$tmp" -- whoami 2>&1 || true)
+    id=$(choose_account_id "$who" || true)
+  fi
+  rm -rf "$xdg"
+  mv "$tmp" "$xdg"
+  chmod -R go-rwx "$xdg"
+  if [ -n "$id" ]; then
+    record_account_id "$name" "$id" "$force"
+    warn_duplicate "$name" "$id"
+    ok "saved wrangler login for '$name' ($id)"
+  else
+    warn "saved wrangler login for '$name', but couldn't tell which account ID to use"
+    warn "set it with: cfa account-id $name <id>   (wrangler whoami lists them)"
+  fi
+}
+
+login_token() { # <name> <force> <account-id>
+  local name=$1 force=$2 id=$3 tok='' who
+  if has_token "$name" && [ "$force" != 1 ]; then
+    die 5 "'$name' already has an API token (use --force to replace it)"
+  fi
+  if [ -t 0 ] && [ -r /dev/tty ]; then
+    {
+      echo "Create a token at https://dash.cloudflare.com/profile/api-tokens"
+      echo "(template \"Edit Cloudflare Workers\" works for wrangler deploy)."
+      printf 'Paste API token for %s (input hidden): ' "$name"
+    } > /dev/tty
+    IFS= read -rs tok < /dev/tty || true
+    echo > /dev/tty
+  else
+    IFS= read -r tok || true
+  fi
+  tok=$(printf '%s' "$tok" | tr -d ' \t\r\n')
+  [ -n "$tok" ] || die 2 "no token given"
+  if [ -z "$id" ]; then
+    if find_wrangler; then
+      who=$(wr_clean "CLOUDFLARE_API_TOKEN=$tok" -- whoami 2>&1 || true)
+      id=$(choose_account_id "$who" || true)
+    fi
+    [ -n "$id" ] || die 1 "couldn't determine the account ID for this token; pass --account-id <id>"
+  fi
+  new_acct_dir "$name"
+  printf '%s\n' "$tok" > "$(acct_token "$name").tmp"
+  chmod 600 "$(acct_token "$name").tmp"
+  mv -f "$(acct_token "$name").tmp" "$(acct_token "$name")"
+  record_account_id "$name" "$id" "$force"
+  warn_duplicate "$name" "$id"
+  ok "saved API token for '$name' ($id)"
+}
+
+LOGIN_BACKUP=''
+LOGIN_DONE=0
+login_cleanup() {
+  local rc=$?
+  if [ "$LOGIN_DONE" != 1 ] && [ -e "$CF_CERT" ] && [ -n "$LOGIN_BACKUP" ]; then
+    # login wrote a cert but we never stored it: keep it rather than lose it.
+    mv -f "$CF_CERT" "$CF_CERT.cfa-unsaved.$$"
+    warn "unsaved new certificate kept at $(tilde "$CF_CERT.cfa-unsaved.$$") (cfa import <name> cloudflared <path>)"
+  fi
+  if [ -n "$LOGIN_BACKUP" ] && { [ -e "$LOGIN_BACKUP" ] || [ -L "$LOGIN_BACKUP" ]; }; then
+    mv -f "$LOGIN_BACKUP" "$CF_CERT"
+  fi
+  LOGIN_BACKUP=''
+  release_lock
+  return $rc
+}
+
+login_cloudflared() { # <name> <force> [cloudflared login args]
+  local name=$1 force=$2 id dest
+  shift 2
+  if has_cert "$name" && [ "$force" != 1 ]; then
+    die 5 "'$name' already has a cloudflared cert (use --force to replace it)"
+  fi
+  need_cloudflared
+  take_lock
+  trap login_cleanup EXIT
+  trap 'exit 130' INT TERM
+
+  mkdir -p "$CF_DIR"
+  if [ -e "$CF_CERT" ] || [ -L "$CF_CERT" ]; then
+    LOGIN_BACKUP="$CF_DIR/.cert.pem.cfa-backup.$$"
+    mv "$CF_CERT" "$LOGIN_BACKUP"
+  fi
+
+  info "Opening the Cloudflare login for '$name' — pick the account and a zone in your browser."
+  if ! env -u TUNNEL_ORIGIN_CERT "$CF_BIN" tunnel login "$@"; then
+    die 6 "cloudflared login failed or was cancelled"
+  fi
+  [ -f "$CF_CERT" ] || die 6 "cloudflared did not write $(tilde "$CF_CERT")"
+
+  id=$(cert_field "$CF_CERT" accountID || true)
+  [ -n "$id" ] || warn "could not read the account ID from the new certificate"
+  new_acct_dir "$name"
+  record_account_id "$name" "$id" "$force"
+  dest=$(acct_dir "$name")
+  mv -f "$CF_CERT" "$dest/cert.pem"
+  chmod 600 "$dest/cert.pem"
+  LOGIN_DONE=1
+
+  login_cleanup
+  trap - EXIT INT TERM
+  warn_duplicate "$name" "$id"
+  ok "saved cloudflared cert for '$name'${id:+ ($id)}"
+}
+
+cmd_import() {
+  local name='' kind='' src='' copy=0 force=0 id=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --copy) copy=1 ;;
+      -f|--force) force=1 ;;
+      --account-id) shift; id=${1-} ;;
+      --account-id=*) id=${1#--account-id=} ;;
+      -*) die 2 "unknown option for import: $1" ;;
+      *)
+        if [ -z "$name" ]; then name=$1
+        elif [ -z "$kind" ] && { [ "$1" = wrangler ] || [ "$1" = cloudflared ]; }; then kind=$1
+        elif [ -z "$src" ]; then src=$1
+        else die 2 "unexpected argument: $1"; fi
+        ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die 2 "usage: cfa import <name> [wrangler|cloudflared] [path] [--copy] [--account-id ID]"
+  require_valid "$name"
+  kind=${kind:-cloudflared}
+  take_lock
+  trap release_lock EXIT
+  case "$kind" in
+    cloudflared) import_cert "$name" "${src:-$CF_CERT}" "$copy" "$force" ;;
+    wrangler) import_oauth "$name" "${src:-$(wrangler_cfg)}" "$copy" "$force" "$id" ;;
+  esac
+  release_lock
+  if ! default_name >/dev/null; then
+    set_default "$name"
+    ok "'$name' is now the default account"
+  else
+    apply_default
+  fi
+}
+
+move_or_copy() { # move_or_copy <src> <dest> <copy>
+  if [ "$3" = 1 ] || [ -L "$1" ]; then
+    cp "$1" "$2.tmp"
+    mv -f "$2.tmp" "$2"
+  else
+    mv -f "$1" "$2"
+  fi
+}
+
+import_cert() { # <name> <src> <copy> <force>
+  local name=$1 src=$2 id
+  [ -e "$src" ] || die 1 "no such file: $src"
+  is_ours "$src" && die 1 "$(tilde "$src") is already managed by cfa"
+  has_cert "$name" && [ "$4" != 1 ] && die 5 "'$name' already has a cloudflared cert (use --force)"
+  id=$(cert_field "$src" accountID || true)
+  if [ -z "$id" ] && [ "$4" != 1 ]; then
+    die 1 "$src does not look like a cloudflared login certificate (use --force to import anyway)"
+  fi
+  new_acct_dir "$name"
+  record_account_id "$name" "$id" "$4"
+  move_or_copy "$src" "$(acct_cert "$name")" "$3"
+  chmod 600 "$(acct_cert "$name")"
+  warn_duplicate "$name" "$id"
+  ok "imported cloudflared cert as '$name'${id:+ ($id)}"
+}
+
+import_oauth() { # <name> <src> <copy> <force> <account-id>
+  local name=$1 src=$2 id=$5 who dest
+  [ -e "$src" ] || die 1 "no wrangler login at $(tilde "$src") (log in with: cfa login $name wrangler)"
+  is_ours "$src" && die 1 "$(tilde "$src") is already managed by cfa"
+  has_oauth "$name" && [ "$4" != 1 ] && die 5 "'$name' already has a wrangler login (use --force)"
+  grep -q '^refresh_token' "$src" || [ "$4" = 1 ] || die 1 "$src does not look like a wrangler OAuth login"
+  new_acct_dir "$name"
+  dest=$(acct_oauth "$name")
+  mkdir -p "$(dirname "$dest")"
+  move_or_copy "$src" "$dest" "$3"
+  chmod -R go-rwx "$(acct_xdg "$name")"
+  if [ "$src" = "$(wrangler_cfg)" ] && [ "$3" != 1 ] && [ -d "$HOME/.wrangler" ]; then
+    warn "you can now remove the legacy ~/.wrangler directory so per-account logins work"
+  fi
+  if [ -z "$id" ]; then
+    if find_wrangler; then
+      who=$(wr_clean "XDG_CONFIG_HOME=$(acct_xdg "$name")" -- whoami 2>&1 || true)
+      id=$(choose_account_id "$who" || true)
+    fi
+  fi
+  if [ -n "$id" ]; then
+    record_account_id "$name" "$id" "$4"
+    warn_duplicate "$name" "$id"
+    ok "imported wrangler login as '$name' ($id)"
+  else
+    ok "imported wrangler login as '$name'"
+    warn "set its account ID with: cfa account-id $name <id>"
+  fi
+}
+
+cmd_logout() {
+  local name='' kind='' yes=0 k
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes) yes=1 ;;
+      -*) die 2 "unknown option for logout: $1" ;;
+      *)
+        if [ -z "$name" ]; then name=$1
+        elif [ -z "$kind" ]; then kind=$1
+        else die 2 "unexpected argument: $1"; fi
+        ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die 2 "usage: cfa logout <name> [wrangler|token|cloudflared|all]"
+  require_exists "$name"
+  kind=${kind:-all}
+  case "$kind" in all|wrangler|token|cloudflared) ;; *) die 2 "unknown kind '$kind'" ;; esac
+  for k in $KINDS; do
+    [ "$kind" = all ] || [ "$kind" = "$k" ] || continue
+    case "$k" in
+      wrangler)
+        has_oauth "$name" || continue
+        need_wrangler
+        info "Revoking the wrangler OAuth login for '$name'…"
+        wr_clean "XDG_CONFIG_HOME=$(acct_xdg "$name")" -- logout || warn "wrangler logout failed; removing the local login anyway"
+        rm -rf "$(acct_xdg "$name")"
+        ok "'$name': wrangler logged out"
+        ;;
+      token)
+        has_token "$name" || continue
+        rm -f "$(acct_token "$name")"
+        ok "'$name': API token removed — also delete it at https://dash.cloudflare.com/profile/api-tokens"
+        ;;
+      cloudflared)
+        has_cert "$name" || continue
+        if [ "$yes" != 1 ] && [ -r /dev/tty ]; then
+          confirm "Delete the cloudflared cert of '$name'? Tunnels you created stay." || continue
+        fi
+        rm -f "$(acct_cert "$name")"
+        ok "'$name': cloudflared cert removed — its API token can be deleted at https://dash.cloudflare.com/profile/api-tokens"
+        ;;
+    esac
+  done
+  if ! acct_exists "$name" && ! ls "$(acct_dir "$name")"/*.json >/dev/null 2>&1; then
+    rm -rf "$(acct_dir "$name")"
+    [ "$(default_name || true)" = "$name" ] && set_default ''
+    info "'$name' has no credentials left and was removed"
+  else
+    apply_default
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Other commands
+# ---------------------------------------------------------------------------
+cmd_list() {
+  local json=0 n cur='' def='' first=1 mark isdef k
+  case "${1-}" in
+    --json) json=1 ;;
+    '') ;;
+    *) die 2 "usage: cfa list [--json]" ;;
+  esac
+  def=$(default_name || true)
+  if _cfa_resolve && [ "$_cfa_name" != none ]; then cur=$_cfa_name; fi
+
+  if [ "$json" = 1 ]; then
+    printf '['
+    for n in $(accounts); do
+      [ "$first" = 1 ] || printf ','
+      first=0
+      printf '{"name":"%s","account_id":"%s","credentials":[' "$n" "$(account_id "$n")"
+      k=$(acct_kinds "$n")
+      printf '%s' "\"${k// /\",\"}\""
+      printf '],"default":%s,"current":%s}' \
+        "$([ "$n" = "$def" ] && echo true || echo false)" \
+        "$([ "$n" = "$cur" ] && echo true || echo false)"
+    done
+    printf ']\n'
+    return 0
+  fi
+
+  if [ -z "$(accounts)" ]; then
+    info "No accounts yet. Add one with: cfa login <name> wrangler   (or: cfa import <name> wrangler)"
+    return 0
+  fi
+  printf '%s  %-18s %-33s %-26s %s%s\n' "$C_DIM" NAME 'ACCOUNT ID' CREDENTIALS DEFAULT "$C_OFF"
+  for n in $(accounts); do
+    mark=' ' isdef=''
+    [ "$n" = "$cur" ] && mark='*'
+    [ "$n" = "$def" ] && isdef='yes'
+    k=$(acct_kinds "$n")
+    printf '%s %-18s %-33s %-26s %s\n' "$mark" "$n" "$(account_id "$n" | sed 's/^$/-/')" "${k// /,}" "$isdef"
+  done
+}
+
+cmd_account_id() {
+  local name=${1-} id=${2-}
+  [ -n "$name" ] || die 2 "usage: cfa account-id <name> [<id>]"
+  require_exists "$name"
+  if [ -z "$id" ]; then
+    account_id "$name"
+    echo
+    return 0
+  fi
+  case "$id" in *[!0-9a-f]*) die 2 "account ID must be 32 hex characters" ;; esac
+  [ "${#id}" -eq 32 ] || die 2 "account ID must be 32 hex characters"
+  set_account_id "$name" "$id"
+  ok "'$name' account ID set to $id"
+}
+
+cmd_remove() {
+  local name='' yes=0 force=0 dir
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes) yes=1 ;;
+      -f|--force) force=1 ;;
+      -*) die 2 "unknown option for remove: $1" ;;
+      *) [ -z "$name" ] || die 2 "unexpected argument: $1"; name=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die 2 "usage: cfa remove <name> [-y] [--force]"
+  require_exists "$name"
+  dir=$(acct_dir "$name")
+  if ls "$dir"/*.json >/dev/null 2>&1 && [ "$force" != 1 ]; then
+    die 1 "'$name' holds tunnel credential files ($(tilde "$dir")/*.json); move them first or use --force"
+  fi
+  if [ "$yes" != 1 ]; then
+    confirm "Remove account '$name' and delete $(tilde "$dir")?" || die 1 "aborted"
+  fi
+  has_oauth "$name" && warn "the wrangler OAuth login was not revoked (next time use: cfa logout $name)"
+  rm -rf "$dir"
+  if [ "$(default_name || true)" = "$name" ]; then
+    set_default ''
+    warn "'$name' was the default; there is no default account now"
+  fi
+  ok "removed '$name'"
+}
+
+cmd_rename() {
+  [ $# -eq 2 ] || die 2 "usage: cfa rename <old> <new>"
+  local old=$1 new=$2 wasdef=0
+  require_exists "$old"
+  require_valid "$new"
+  [ ! -e "$(acct_dir "$new")" ] || die 5 "account '$new' already exists"
+  [ "$(default_name || true)" = "$old" ] && wasdef=1
+  mv "$(acct_dir "$old")" "$(acct_dir "$new")"
+  if [ "$wasdef" = 1 ]; then set_default "$new"; fi
+  if [ -f "$H/config" ] && grep -q "=$old\$" "$H/config"; then
+    sed "s/=$old\$/=$new/" "$H/config" > "$H/config.tmp" && mv -f "$H/config.tmp" "$H/config"
+  fi
+  ok "renamed '$old' → '$new'"
+  [ "${CFA_ACCOUNT-}" = "$old" ] && warn "this shell still selects '$old'; run: cfa use $new"
+  warn ".cfa-account files that say '$old' must be updated by hand"
+}
+
+cmd_use() {
+  local print=0 shell=sh target=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --print) print=1 ;;
+      --shell) shift; shell=${1-} ;;
+      --shell=*) shell=${1#--shell=} ;;
+      --clear) target=--clear ;;
+      -*) die 2 "unknown option for use: $1" ;;
+      *) [ -z "$target" ] || die 2 "unexpected argument: $1"; target=$1 ;;
+    esac
+    shift
+  done
+  if [ -z "$target" ]; then
+    printf 'usage: cfa use <name|none> | cfa use --clear\n\n' >&2
+    cmd_list >&2
+    exit 2
+  fi
+  case "$target" in
+    --clear|none) ;;
+    *) require_exists "$target" ;;
+  esac
+
+  if [ "$print" != 1 ]; then
+    # shellcheck disable=SC2016 # printing literal shell code
+    {
+      printf '%scfa:%s `cfa use` needs the shell integration to change your current shell.\n' "$C_RED" "$C_OFF"
+      printf '  Add to your shell rc:  eval "$(cfa init %s)"\n' "$(basename "${SHELL:-zsh}")"
+      printf '  Or, for one command:   cfa exec %s -- <command>\n' "${target#--clear}"
+    } >&2
+    exit 3
+  fi
+
+  external_cert && warn "TUNNEL_ORIGIN_CERT is set outside cfa ($(tilde "$TUNNEL_ORIGIN_CERT")) and wins for cloudflared"
+  external_wrangler && warn "CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID are set outside cfa and win for wrangler"
+  case "$shell:$target" in
+    fish:--clear) echo 'set -e CFA_ACCOUNT' ;;
+    fish:*) echo "set -gx CFA_ACCOUNT $(sq_fish "$target")" ;;
+    *:--clear) echo 'unset CFA_ACCOUNT' ;;
+    *) echo "export CFA_ACCOUNT=$(sq "$target")" ;;
+  esac
+  case "$target" in
+    --clear) info "cleared shell override; directory pins and the default apply again" ;;
+    none) info "no account in this shell (tools fall back to their own global login)" ;;
+    *) info "using '$target' in this shell" ;;
+  esac
+}
+
+cmd_default() {
+  local def wcfg
+  case "${1-}" in
+    '')
+      def=$(default_name) || die 1 "no default account (set one with: cfa default <name>)"
+      printf '%s\n' "$def"
+      ;;
+    --unset)
+      default_name >/dev/null || die 1 "no default account"
+      set_default ''
+      ok "default account unset"
+      ;;
+    -*) die 2 "usage: cfa default [<name> | --unset]" ;;
+    *)
+      require_exists "$1"
+      wcfg=$(wrangler_cfg)
+      if has_cert "$1" && [ -e "$CF_CERT" ] && [ ! -L "$CF_CERT" ]; then
+        die 1 "$(tilde "$CF_CERT") is a real file, not managed by cfa; adopt it first: cfa import <name> cloudflared"
+      fi
+      if has_oauth "$1" && [ -e "$wcfg" ] && [ ! -L "$wcfg" ]; then
+        die 1 "$(tilde "$wcfg") is a wrangler login not managed by cfa; adopt it first: cfa import <name> wrangler"
+      fi
+      set_default "$1"
+      ok "default account is now '$1'"
+      ;;
+  esac
+}
+
+exec_env() { # exec_env <name>: export everything a command needs for <name>
+  local a tok id
+  a=$(acct_dir "$1")
+  TUNNEL_ORIGIN_CERT="$a/cert.pem"
+  _CFA_EXPORTED=$TUNNEL_ORIGIN_CERT
+  id=$(account_id "$1")
+  CLOUDFLARE_ACCOUNT_ID=${id:-cfa-no-account-id}
+  _CFA_ACCOUNT_ID=$CLOUDFLARE_ACCOUNT_ID
+  unset CLOUDFLARE_API_KEY CLOUDFLARE_EMAIL CF_API_TOKEN CF_ACCOUNT_ID
+  if has_token "$1"; then
+    IFS= read -r tok < "$a/token" || true
+    CLOUDFLARE_API_TOKEN=$tok
+    _CFA_TOKEN_FP="${#tok}:${tok#"${tok%??????}"}"
+    export CLOUDFLARE_API_TOKEN _CFA_TOKEN_FP
+  else
+    unset CLOUDFLARE_API_TOKEN _CFA_TOKEN_FP
+    if has_oauth "$1"; then
+      XDG_CONFIG_HOME="$a/xdg"
+      _CFA_WRANGLER_XDG=$XDG_CONFIG_HOME
+      export XDG_CONFIG_HOME _CFA_WRANGLER_XDG
+    fi
+  fi
+  CFA_ACCOUNT=$1
+  export TUNNEL_ORIGIN_CERT _CFA_EXPORTED CLOUDFLARE_ACCOUNT_ID _CFA_ACCOUNT_ID CFA_ACCOUNT
+}
+
+cmd_exec() {
+  local name=''
+  if [ "${1-}" != -- ]; then
+    name=${1-}
+    shift || true
+  fi
+  [ "${1-}" = -- ] && shift
+  [ $# -gt 0 ] || die 2 "usage: cfa exec [<name>] -- <command> [args...]"
+  name=$(name_or_current "$name")
+  exec_env "$name"
+  exec "$@"
+}
+
+cmd_each() {
+  local n rc=0 any=0
+  [ "${1-}" = -- ] && shift
+  [ $# -gt 0 ] || die 2 "usage: cfa each -- <command> [args...]"
+  for n in $(accounts); do
+    any=1
+    printf '%s==> %s%s %s\n' "$C_BLD" "$n" "$C_OFF" "$C_DIM$(account_id "$n")$C_OFF" >&2
+    (exec_env "$n" && "$@") || rc=$?
+  done
+  [ "$any" = 1 ] || info "No accounts yet."
+  return $rc
+}
+
+cmd_pin() {
+  local name
+  name=$(name_or_current "${1-}")
+  printf '%s\n' "$name" > .cfa-account
+  chmod 644 .cfa-account
+  ok "pinned '$name' to $(tilde "$PWD") (.cfa-account)"
+}
+
+cmd_unpin() {
+  [ -f .cfa-account ] || die 1 "no .cfa-account in $(tilde "$PWD")"
+  rm -f .cfa-account
+  ok "removed $(tilde "$PWD")/.cfa-account"
+}
+
+cmd_current() {
+  local only_name=0 rc=0
+  case "${1-}" in
+    --name) only_name=1 ;;
+    '') ;;
+    *) die 2 "usage: cfa current [--name]" ;;
+  esac
+  if ! _cfa_resolve || [ "$_cfa_name" = none ]; then
+    [ "$only_name" = 1 ] && return 1
+    if [ "${_cfa_name-}" = none ]; then
+      printf 'none  (source: %s)\n' "$_cfa_src"
+    else
+      warn "no account selected (try: cfa use <name>, cfa pin <name> or cfa default <name>)"
+    fi
+    rc=1
+  elif [ "$only_name" = 1 ]; then
+    printf '%s\n' "$_cfa_name"
+  else
+    printf '%s  (source: %s)\n' "$_cfa_name" "$(pretty_src "$_cfa_src")"
+  fi
+  if [ "$only_name" != 1 ]; then
+    external_cert && printf '  cloudflared: external TUNNEL_ORIGIN_CERT=%s\n' "$(tilde "$TUNNEL_ORIGIN_CERT")"
+    external_wrangler && printf '  wrangler: external CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID\n'
+  fi
+  [ "$rc" = 0 ] || return $rc
+  if ! _cfa_valid_name "$_cfa_name" || ! acct_exists "$_cfa_name"; then
+    warn "account '$_cfa_name' does not exist — tools will fail rather than use another account"
+    return 4
+  fi
+}
+
+cmd_whoami() {
+  local name src='argument' f
+  if [ -z "${1-}" ]; then
+    name=$(name_or_current "")
+    _cfa_resolve || true
+    src=$_cfa_src
+  else
+    name=$(name_or_current "$1")
+  fi
+  printf 'account      %s\n' "$name"
+  printf 'account id   %s\n' "$(account_id "$name" | sed 's/^$/(unknown — cfa account-id <name> <id>)/')"
+  f=$(acct_oauth "$name")
+  if [ -f "$f" ]; then
+    printf 'wrangler     OAuth login (access token expires %s; refreshed automatically)\n' "$(oauth_expiry "$f")"
+  else
+    printf 'wrangler     %s\n' "$(has_token "$name" && echo 'API token' || echo '-')"
+  fi
+  has_oauth "$name" && has_token "$name" && printf '             + API token (takes precedence)\n'
+  if has_cert "$name"; then
+    printf 'cloudflared  cert, zone %s\n' "$(cert_field "$(acct_cert "$name")" zoneID || echo '?')"
+  else
+    printf 'cloudflared  -\n'
+  fi
+  printf 'store        %s\n' "$(tilde "$(acct_dir "$name")")"
+  printf 'selected by  %s\n' "$(pretty_src "$src")"
+}
+
+cmd_path() {
+  local name
+  name=$(name_or_current "${1-}")
+  acct_dir "$name"
+  echo
+}
+
+cmd_map() {
+  local cfg="$H/config" major name
+  case "${1-}" in
+    list|'')
+      [ -f "$cfg" ] && grep '^node\.' "$cfg" | sed 's/^node\.\([^=]*\)=/node \1 → /' || true
+      ;;
+    node)
+      major=${2-}
+      name=${3-}
+      case "$major" in ''|*[!0-9]*) die 2 "usage: cfa map node <major> <name|--unset>" ;; esac
+      [ -n "$name" ] || die 2 "usage: cfa map node <major> <name|--unset>"
+      ensure_home
+      touch "$cfg"
+      grep -v "^node\.$major=" "$cfg" > "$cfg.tmp" || true
+      if [ "$name" != --unset ]; then
+        require_exists "$name"
+        printf 'node.%s=%s\n' "$major" "$name" >> "$cfg.tmp"
+      fi
+      mv -f "$cfg.tmp" "$cfg"
+      if [ "$name" = --unset ]; then ok "removed mapping for Node $major"
+      else ok "Node $major → '$name' (needs the shell hook; pins and 'cfa use' still win)"; fi
+      ;;
+    *) die 2 "usage: cfa map list | cfa map node <major> <name|--unset>" ;;
+  esac
+}
+
+cmd_doctor() {
+  local errs=0 warns=0 n m id ids='' f cfg def wcfg
+  d_ok() { printf '  %s✓%s %s\n' "$C_GRN" "$C_OFF" "$*"; }
+  d_warn() { printf '  %s!%s %s\n' "$C_YLW" "$C_OFF" "$*"; warns=$((warns + 1)); }
+  d_err() { printf '  %s✗%s %s\n' "$C_RED" "$C_OFF" "$*"; errs=$((errs + 1)); }
+
+  echo "cfa $CFA_VERSION"
+  echo "Tools"
+  if [ -n "${CFA_WRANGLER-}" ] || command -v wrangler >/dev/null 2>&1; then
+    d_ok "wrangler: $(command -v "${CFA_WRANGLER:-wrangler}")"
+  elif command -v npx >/dev/null 2>&1; then
+    d_ok "wrangler: via npx"
+  else
+    d_warn "wrangler not found (needed for 'cfa login <name> wrangler')"
+  fi
+  CF_BIN=${CFA_CLOUDFLARED:-$(command -v cloudflared || true)}
+  if [ -n "$CF_BIN" ] && [ -x "$CF_BIN" ]; then
+    d_ok "cloudflared: $("$CF_BIN" --version 2>/dev/null | head -n1)"
+  else
+    d_ok "cloudflared not installed (only needed for tunnels)"
+  fi
+
+  echo "Accounts"
+  if [ -d "$H" ]; then
+    m=$(file_mode "$H")
+    if [ "$m" = 700 ]; then d_ok "store $(tilde "$H") (700)"; else d_warn "store $(tilde "$H") has mode $m (expected 700): chmod 700 $(tilde "$H")"; fi
+  else
+    d_warn "store $(tilde "$H") does not exist yet (run: cfa login <name>)"
+  fi
+  for n in $(accounts); do
+    id=$(account_id "$n")
+    if [ -z "$id" ]; then
+      d_err "$n: unknown account ID (set it: cfa account-id $n <id>)"
+    else
+      d_ok "$n: $id ($(acct_kinds "$n" | sed 's/ /, /g'))"
+      case " $ids " in *" $id "*) d_warn "$n: same Cloudflare account ID as another entry" ;; esac
+      ids="$ids $id"
+    fi
+    if has_cert "$n"; then
+      f=$(acct_cert "$n")
+      m=$(file_mode "$f")
+      [ "$m" = 600 ] || d_warn "$n: cert mode $m (expected 600): chmod 600 $(tilde "$f")"
+      local cid
+      cid=$(cert_field "$f" accountID || true)
+      if [ -z "$cid" ]; then d_err "$n: cloudflared cert can't be decoded ($(tilde "$f"))"
+      elif [ -n "$id" ] && [ "$cid" != "$id" ]; then d_err "$n: cloudflared cert is for account $cid, not $id"; fi
+    fi
+    if has_token "$n"; then
+      m=$(file_mode "$(acct_token "$n")")
+      [ "$m" = 600 ] || d_warn "$n: token mode $m (expected 600): chmod 600 $(tilde "$(acct_token "$n")")"
+    fi
+    if has_oauth "$n"; then
+      m=$(file_mode "$(acct_oauth "$n")")
+      [ "$m" = 600 ] || d_warn "$n: wrangler login mode $m (expected 600)"
+    fi
+  done
+  if [ -d "$H" ]; then
+    for f in "$H"/*/; do
+      [ -d "$f" ] || continue
+      n=${f%/}; n=${n##*/}
+      if ! _cfa_valid_name "$n" || ! acct_exists "$n"; then
+        d_warn "ignoring $(tilde "${f%/}") (invalid name or no credentials)"
+      fi
+    done
+  fi
+
+  echo "Defaults"
+  def=$(default_name || true)
+  if [ -z "$def" ]; then
+    d_warn "no default account (tools outside your shell use their own global login): cfa default <name>"
+  elif ! acct_exists "$def"; then
+    d_err "default account '$def' does not exist"
+  else
+    d_ok "default: $def"
+  fi
+  wcfg=$(wrangler_cfg)
+  if [ -d "$HOME/.wrangler" ]; then
+    d_warn "$(tilde "$HOME/.wrangler") exists: wrangler ignores XDG_CONFIG_HOME, so per-account wrangler logins can't work (cfa import <name> wrangler, then remove it)"
+  fi
+  if is_ours "$wcfg"; then
+    [ -e "$wcfg" ] || d_err "wrangler global login is a broken symlink: $(tilde "$wcfg")"
+  elif [ -e "$wcfg" ]; then
+    d_warn "wrangler global login $(tilde "$wcfg") is not managed by cfa (adopt it: cfa import <name> wrangler)"
+  fi
+  if is_ours "$CF_CERT"; then
+    [ -e "$CF_CERT" ] || d_err "cloudflared default cert is a broken symlink"
+  elif [ -L "$CF_CERT" ]; then
+    d_warn "$(tilde "$CF_CERT") is a symlink not managed by cfa → $(readlink "$CF_CERT")"
+  elif [ -e "$CF_CERT" ]; then
+    d_warn "$(tilde "$CF_CERT") is not managed by cfa (adopt it: cfa import <name> cloudflared)"
+  fi
+  for cfg in "$CF_DIR/config.yml" "$CF_DIR/config.yaml"; do
+    if [ -f "$cfg" ] && grep -q '^[[:space:]]*origincert:' "$cfg"; then
+      d_warn "$(tilde "$cfg") sets 'origincert:' which overrides cfa for tunnels using it"
+    fi
+  done
+
+  echo "This shell"
+  if [ -n "${_CFA_HOOK-}" ]; then
+    d_ok "shell hook loaded (${_CFA_HOOK})"
+  else
+    d_warn "shell hook not loaded: add eval \"\$(cfa init $(basename "${SHELL:-zsh}"))\" to your rc file"
+  fi
+  external_cert && d_warn "TUNNEL_ORIGIN_CERT is set outside cfa: $(tilde "$TUNNEL_ORIGIN_CERT")"
+  external_wrangler && d_warn "CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID are set outside cfa"
+  if _cfa_resolve && [ "$_cfa_name" != none ]; then
+    if _cfa_valid_name "$_cfa_name" && acct_exists "$_cfa_name"; then
+      d_ok "current: $_cfa_name ($(pretty_src "$_cfa_src"))"
+    else
+      d_err "current selection '$_cfa_name' ($(pretty_src "$_cfa_src")) is not an existing account"
+    fi
+  fi
+  if [ -f "$H/config" ]; then
+    while IFS= read -r f || [ -n "$f" ]; do
+      case "$f" in
+        node.*=*)
+          n=${f#*=}
+          acct_exists "$n" 2>/dev/null || d_err "mapping '${f%%=*}' points to missing account '$n'"
+          ;;
+      esac
+    done < "$H/config"
+  fi
+  for f in "$CF_DIR"/.cert.pem.cfa-backup.* "$CF_DIR"/cert.pem.cfa-unsaved.*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    d_warn "leftover from an interrupted login: $(tilde "$f")"
+  done
+  [ -d "$H/.lock" ] && d_warn "lock present: $(tilde "$H/.lock") (remove it if no cfa command is running)"
+
+  echo
+  if [ "$errs" -gt 0 ]; then
+    printf '%s%d problem(s), %d warning(s)%s\n' "$C_RED" "$errs" "$warns" "$C_OFF"
+    return 1
+  fi
+  printf '%sno problems%s%s\n' "$C_GRN" "$C_OFF" "$([ "$warns" -gt 0 ] && echo ", $warns warning(s)")"
+}
+
+self_path() {
+  case "$0" in
+    /*) printf '%s' "$0" ;;
+    */*) printf '%s/%s' "$(cd "$(dirname "$0")" && pwd)" "$(basename "$0")" ;;
+    *) command -v "$0" ;;
+  esac
+}
+
+cmd_init() {
+  local shell=${1-} bin
+  bin=$(self_path)
+  case "$shell" in
+    zsh)
+      printf '# cfa shell integration (zsh) — %s\n' "$CFA_URL"
+      printf '_CFA_BIN=%s\nexport _CFA_HOOK=zsh\n' "$(sq "$bin")"
+      printf '%s\n%s\n' "$CFA_SH_CORE" "$CFA_SH_HOOK"
+      [ -n "${CFA_NO_WRANGLER_WRAPPER-}" ] || printf '%s\n' "$CFA_SH_WRANGLER"
+      cat <<'EOF'
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _cfa_sync
+add-zsh-hook chpwd _cfa_sync
+_cfa_sync
+EOF
+      completion_zsh
+      printf '(( $+functions[compdef] )) && compdef _cfa cfa\n'
+      ;;
+    bash)
+      printf '# cfa shell integration (bash) — %s\n' "$CFA_URL"
+      printf '_CFA_BIN=%s\nexport _CFA_HOOK=bash\n' "$(sq "$bin")"
+      printf '%s\n%s\n' "$CFA_SH_CORE" "$CFA_SH_HOOK"
+      [ -n "${CFA_NO_WRANGLER_WRAPPER-}" ] || printf '%s\n' "$CFA_SH_WRANGLER"
+      cat <<'EOF'
+case ";${PROMPT_COMMAND-};" in
+  *";_cfa_sync;"*) ;;
+  *) PROMPT_COMMAND="_cfa_sync${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+esac
+_cfa_sync
+EOF
+      completion_bash
+      ;;
+    fish)
+      printf '# cfa shell integration (fish) — %s\n' "$CFA_URL"
+      printf 'set -g _CFA_BIN %s\nset -gx _CFA_HOOK fish\n' "$(sq_fish "$bin")"
+      init_fish
+      if [ -z "${CFA_NO_WRANGLER_WRAPPER-}" ]; then
+        cat <<'EOF'
+function wrangler --wraps wrangler --description 'wrangler with the cfa-selected OAuth login'
+    if set -q _CFA_WRANGLER_XDG; and test -n "$_CFA_WRANGLER_XDG"; and not set -q CLOUDFLARE_API_TOKEN
+        XDG_CONFIG_HOME=$_CFA_WRANGLER_XDG command wrangler $argv
+    else
+        command wrangler $argv
+    end
+end
+EOF
+      fi
+      completion_fish
+      ;;
+    *) die 2 "usage: cfa init <zsh|bash|fish>" ;;
+  esac
+}
+
+init_fish() {
+  cat <<'EOF'
+function _cfa_valid_name
+    string match -qr '^[a-z0-9][a-z0-9_-]{0,31}$' -- "$argv[1]"; or return 1
+    not contains -- "$argv[1]" default none
+end
+
+function _cfa_resolve
+    set -g _cfa_name ''
+    set -g _cfa_src ''
+    set -g _cfa_h "$HOME/.config/cfa"
+    if set -q CFA_HOME; and test -n "$CFA_HOME"
+        set _cfa_h "$CFA_HOME"
+    end
+    if set -q CFA_ACCOUNT; and test -n "$CFA_ACCOUNT"
+        set _cfa_name "$CFA_ACCOUNT"
+        set _cfa_src 'shell (cfa use)'
+        return 0
+    end
+    if not set -q CFA_NO_DIR; or test -z "$CFA_NO_DIR"
+        set -l d "$PWD"
+        while true
+            if test -f "$d/.cfa-account"
+                set -l line (head -n1 "$d/.cfa-account" 2>/dev/null)
+                set _cfa_name (string split -f1 ' ' -- (string trim -- "$line"))
+                set _cfa_src "pin $d/.cfa-account"
+                return 0
+            end
+            test -z "$d"; and break
+            set d (string replace -r '/[^/]*$' '' -- "$d")
+        end
+    end
+    if set -q NVM_BIN; and test -f "$_cfa_h/config"
+        set -l v (string replace -r '^.*/v?([0-9]+)[^/]*/bin$' '$1' -- "$NVM_BIN")
+        if string match -qr '^[0-9]+$' -- "$v"
+            set -l hit (string match -r "^node\.$v=.*" < "$_cfa_h/config")
+            if test -n "$hit[1]"
+                set _cfa_name (string replace -r '^[^=]*=' '' -- "$hit[1]")
+                set _cfa_src "node v$v mapping"
+                return 0
+            end
+        end
+    end
+    if test -f "$_cfa_h/default"
+        set -l line (head -n1 "$_cfa_h/default" 2>/dev/null)
+        if test -n "$line"
+            set _cfa_name (string trim -- "$line")
+            set _cfa_src default
+            return 0
+        end
+    end
+    return 1
+end
+
+function _cfa_fp
+    set -l n (string length -- "$argv[1]")
+    if test $n -ge 6
+        echo "$n:"(string sub -s -6 -- "$argv[1]")
+    else
+        echo "$n:"
+    end
+end
+
+function _cfa_sync --on-event fish_prompt --on-variable PWD
+    set -l a ''
+    set -g _CFA_NAME ''
+    if _cfa_resolve; and test "$_cfa_name" != none
+        if _cfa_valid_name "$_cfa_name"
+            set a "$_cfa_h/$_cfa_name"
+            set _CFA_NAME "$_cfa_name"
+            test -d "$a"; or set _CFA_NAME "$_cfa_name?"
+        else
+            set a "$_cfa_h/.invalid-account-name"
+            set _CFA_NAME 'invalid?'
+        end
+    end
+
+    # cloudflared
+    if set -q TUNNEL_ORIGIN_CERT; and test -n "$TUNNEL_ORIGIN_CERT"; and test "$TUNNEL_ORIGIN_CERT" != "$_CFA_EXPORTED"
+        # set outside cfa: leave it
+    else if test -n "$a"
+        set -gx _CFA_EXPORTED "$a/cert.pem"
+        set -gx TUNNEL_ORIGIN_CERT "$a/cert.pem"
+    else
+        set -e TUNNEL_ORIGIN_CERT
+        set -e _CFA_EXPORTED
+    end
+
+    # wrangler
+    set -l ext 0
+    if set -q CLOUDFLARE_API_TOKEN; and test -n "$CLOUDFLARE_API_TOKEN"
+        set -l fp (_cfa_fp "$CLOUDFLARE_API_TOKEN")
+        test "$fp" != "$_CFA_TOKEN_FP"; and set ext 1
+    end
+    if set -q CLOUDFLARE_ACCOUNT_ID; and test -n "$CLOUDFLARE_ACCOUNT_ID"; and test "$CLOUDFLARE_ACCOUNT_ID" != "$_CFA_ACCOUNT_ID"
+        set ext 1
+    end
+    if test $ext = 1
+        # set outside cfa: drop whatever half we exported so they don't mix
+        if set -q CLOUDFLARE_API_TOKEN; and test (_cfa_fp "$CLOUDFLARE_API_TOKEN") = "$_CFA_TOKEN_FP"
+            set -e CLOUDFLARE_API_TOKEN
+        end
+        if set -q CLOUDFLARE_ACCOUNT_ID; and test "$CLOUDFLARE_ACCOUNT_ID" = "$_CFA_ACCOUNT_ID"
+            set -e CLOUDFLARE_ACCOUNT_ID
+        end
+        set -e _CFA_TOKEN_FP
+        set -e _CFA_ACCOUNT_ID
+        set -e _CFA_WRANGLER_XDG
+    else if test -n "$a"
+        set -l tok ''
+        test -f "$a/token"; and set tok (head -n1 "$a/token" 2>/dev/null)
+        if test -n "$tok"
+            set -gx CLOUDFLARE_API_TOKEN "$tok"
+            set -gx _CFA_TOKEN_FP (_cfa_fp "$tok")
+        else
+            set -e CLOUDFLARE_API_TOKEN
+            set -e _CFA_TOKEN_FP
+        end
+        set -l id ''
+        test -f "$a/account_id"; and set id (head -n1 "$a/account_id" 2>/dev/null)
+        test -n "$id"; or set id cfa-no-account-id
+        set -gx CLOUDFLARE_ACCOUNT_ID "$id"
+        set -gx _CFA_ACCOUNT_ID "$id"
+        if test -f "$a/xdg/.wrangler/config/default.toml"
+            set -gx _CFA_WRANGLER_XDG "$a/xdg"
+        else
+            set -e _CFA_WRANGLER_XDG
+        end
+    else
+        set -e CLOUDFLARE_API_TOKEN
+        set -e _CFA_TOKEN_FP
+        set -e CLOUDFLARE_ACCOUNT_ID
+        set -e _CFA_ACCOUNT_ID
+        set -e _CFA_WRANGLER_XDG
+    end
+end
+
+function cfa --description 'Cloudflare account switcher for wrangler and cloudflared'
+    if test (count $argv) -ge 1; and test "$argv[1]" = use
+        set -l rest $argv
+        set -e rest[1]
+        set -l out ($_CFA_BIN use --print --shell fish $rest); or return $status
+        for line in $out
+            eval $line
+        end
+        _cfa_sync
+        return 0
+    end
+    $_CFA_BIN $argv
+    set -l rc $status
+    _cfa_sync
+    return $rc
+end
+
+_cfa_sync
+EOF
+}
+
+CFA_COMMANDS='login logout import list ls remove rm rename use default exec each pin unpin current whoami account-id path map doctor init completion help version'
+NAME_COMMANDS='logout remove rm rename use default exec pin whoami account-id path'
+
+completion_bash() {
+  cat <<EOF
+_cfa() {
+  local cur=\${COMP_WORDS[COMP_CWORD]}
+  if [ "\$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=(\$(compgen -W "$CFA_COMMANDS" -- "\$cur"))
+    return
+  fi
+  case "\${COMP_WORDS[1]}" in
+    init|completion) [ "\$COMP_CWORD" -eq 2 ] && COMPREPLY=(\$(compgen -W "zsh bash fish" -- "\$cur")) ;;
+    login) [ "\$COMP_CWORD" -eq 3 ] && COMPREPLY=(\$(compgen -W "wrangler token cloudflared" -- "\$cur")) ;;
+    import) [ "\$COMP_CWORD" -eq 3 ] && COMPREPLY=(\$(compgen -W "wrangler cloudflared" -- "\$cur")) ;;
+    logout) if [ "\$COMP_CWORD" -eq 2 ]; then COMPREPLY=(\$(compgen -W "\$(cfa __accounts 2>/dev/null)" -- "\$cur"));
+            elif [ "\$COMP_CWORD" -eq 3 ]; then COMPREPLY=(\$(compgen -W "wrangler token cloudflared all" -- "\$cur")); fi ;;
+    map) if [ "\$COMP_CWORD" -eq 2 ]; then COMPREPLY=(\$(compgen -W "node list" -- "\$cur"));
+         elif [ "\$COMP_CWORD" -eq 4 ]; then COMPREPLY=(\$(compgen -W "\$(cfa __accounts 2>/dev/null) --unset" -- "\$cur")); fi ;;
+    use) [ "\$COMP_CWORD" -eq 2 ] && COMPREPLY=(\$(compgen -W "\$(cfa __accounts 2>/dev/null) none --clear" -- "\$cur")) ;;
+    ${NAME_COMMANDS// /|}) [ "\$COMP_CWORD" -eq 2 ] && COMPREPLY=(\$(compgen -W "\$(cfa __accounts 2>/dev/null)" -- "\$cur")) ;;
+  esac
+}
+complete -F _cfa cfa
+EOF
+}
+
+completion_zsh() {
+  cat <<'EOF'
+_cfa() {
+  local -a cmds accts
+  cmds=(
+    'login:log in to a Cloudflare account (wrangler, token or cloudflared)'
+    'logout:revoke/remove credentials of an account'
+    'import:adopt an existing wrangler login or cloudflared cert'
+    'list:list accounts' 'ls:list accounts'
+    'remove:delete an account' 'rm:delete an account'
+    'rename:rename an account'
+    'use:select an account for this shell'
+    'default:show or set the machine-wide default'
+    'exec:run a command with an account'
+    'each:run a command once per account'
+    'pin:pin an account to this directory' 'unpin:remove the pin here'
+    'current:show the selected account and why'
+    'whoami:show account details'
+    'account-id:show or set the Cloudflare account ID'
+    'path:print the account directory'
+    'map:map Node versions to accounts'
+    'doctor:check the setup'
+    'init:print shell integration' 'completion:print shell completion'
+    'help:show help' 'version:show version'
+  )
+  accts=(${(f)"$(cfa __accounts 2>/dev/null)"})
+  if (( CURRENT == 2 )); then
+    _describe -t commands 'cfa command' cmds
+    return
+  fi
+  case $words[2] in
+    use) (( CURRENT == 3 )) && compadd -- $accts none --clear ;;
+    login) (( CURRENT == 4 )) && compadd wrangler token cloudflared ;;
+    import) (( CURRENT == 4 )) && compadd wrangler cloudflared ;;
+    logout) (( CURRENT == 3 )) && compadd -- $accts; (( CURRENT == 4 )) && compadd wrangler token cloudflared all ;;
+    remove|rm|rename|default|pin|whoami|account-id|path) (( CURRENT == 3 )) && compadd -- $accts ;;
+    exec) if (( CURRENT == 3 )); then compadd -- $accts; else _normal; fi ;;
+    each) (( CURRENT > 2 )) && _normal ;;
+    init|completion) (( CURRENT == 3 )) && compadd zsh bash fish ;;
+    map) (( CURRENT == 3 )) && compadd node list; (( CURRENT == 5 )) && compadd -- $accts --unset ;;
+  esac
+}
+EOF
+}
+
+completion_fish() {
+  local c
+  printf 'complete -c cfa -f\n'
+  for c in $CFA_COMMANDS; do
+    printf "complete -c cfa -n '__fish_use_subcommand' -a %s\n" "$c"
+  done
+  printf "complete -c cfa -n '__fish_seen_subcommand_from %s' -a '(cfa __accounts 2>/dev/null)'\n" "$NAME_COMMANDS"
+  printf "complete -c cfa -n '__fish_seen_subcommand_from use' -a 'none --clear'\n"
+  printf "complete -c cfa -n '__fish_seen_subcommand_from login' -a 'wrangler token cloudflared'\n"
+  printf "complete -c cfa -n '__fish_seen_subcommand_from import' -a 'wrangler cloudflared'\n"
+  printf "complete -c cfa -n '__fish_seen_subcommand_from init completion' -a 'zsh bash fish'\n"
+}
+
+cmd_completion() {
+  case "${1-}" in
+    bash) completion_bash ;;
+    zsh) printf '#compdef cfa\n'; completion_zsh; printf '_cfa "$@"\n' ;;
+    fish) completion_fish ;;
+    *) die 2 "usage: cfa completion <bash|zsh|fish>" ;;
+  esac
+}
+
+usage_login() {
+  cat <<'EOF'
+usage: cfa login <name> [wrangler|token|cloudflared] [--account-id ID] [--force] [-- args]
+
+  wrangler     OAuth login in the browser (runs `wrangler login`)
+  token        store a Cloudflare API token (prompted, or read from stdin)
+  cloudflared  tunnel cert in the browser (runs `cloudflared tunnel login`)
+
+One name can hold all three for the same Cloudflare account. The account ID is
+detected with `wrangler whoami`; pass --account-id when a login can see several.
+Your existing global logins are never overwritten.
+EOF
+}
+
+usage() {
+  cat <<EOF
+cfa $CFA_VERSION — use several Cloudflare accounts with wrangler and cloudflared
+
+Usage: cfa <command> [args]
+
+Accounts
+  login <name> [wrangler|token|cloudflared]   Log in and save under <name>
+  import <name> [wrangler|cloudflared] [path] Adopt an existing global login
+  logout <name> [wrangler|token|cloudflared]  Revoke/remove credentials
+  list [--json]                               List accounts (* = selected here)
+  account-id <name> [<id>]                    Show or set the Cloudflare account ID
+  rename <old> <new> / remove <name> [-y]     Manage accounts
+
+Switching
+  use <name|none|--clear>   Select an account for this shell (needs 'cfa init')
+  pin [<name>] / unpin      Pin an account to this directory (.cfa-account)
+  default [<name>|--unset]  Machine-wide default (global wrangler/cloudflared login)
+  exec [<name>] -- cmd...   Run one command with an account
+  each -- cmd...            Run a command once per account
+
+Inspect
+  current [--name]          Selected account and where it comes from
+  whoami [<name>]           Account ID and stored credentials
+  path [<name>]             Print the account directory
+  doctor                    Check the setup
+
+Setup
+  init <zsh|bash|fish>      Shell integration: eval "\$(cfa init zsh)"
+  completion <shell>        Shell completion only
+  map node <major> <name>   Select an account by active nvm Node version
+
+Selection order: cfa exec > cfa use > .cfa-account > node mapping > default
+Docs: $CFA_URL
+EOF
+}
+
+main() {
+  setup_color
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -q|--quiet) QUIET=1 ;;
+      --no-color) C_RED='' C_GRN='' C_YLW='' C_DIM='' C_BLD='' C_OFF='' ;;
+      *) break ;;
+    esac
+    shift
+  done
+  local cmd=${1-help}
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    login) cmd_login "$@" ;;
+    logout) cmd_logout "$@" ;;
+    import) cmd_import "$@" ;;
+    list|ls) cmd_list "$@" ;;
+    account-id) cmd_account_id "$@" ;;
+    remove|rm) cmd_remove "$@" ;;
+    rename|mv) cmd_rename "$@" ;;
+    use) cmd_use "$@" ;;
+    default) cmd_default "$@" ;;
+    exec) cmd_exec "$@" ;;
+    each) cmd_each "$@" ;;
+    pin) cmd_pin "$@" ;;
+    unpin) cmd_unpin "$@" ;;
+    current) cmd_current "$@" ;;
+    whoami) cmd_whoami "$@" ;;
+    path) cmd_path "$@" ;;
+    map) cmd_map "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    init) cmd_init "$@" ;;
+    completion) cmd_completion "$@" ;;
+    __accounts) accounts ;;
+    help|-h|--help) usage ;;
+    version|-V|--version) echo "cfa $CFA_VERSION" ;;
+    *) die 2 "unknown command '$cmd' (see: cfa help)" ;;
+  esac
+}
+
+main "$@"
