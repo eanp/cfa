@@ -42,7 +42,16 @@ jobs:
           CFA_TEST_BASH: ${{ matrix.test_bash }}
         run: |
           if [ -n "$CFA_TEST_BASH" ]; then "$CFA_TEST_BASH" --version | head -n1; fi
-          bats --print-output-on-failure test
+          command -v zsh fish || true
+          set -o pipefail
+          if ! bats --print-output-on-failure test | tee bats.out; then
+            # Surface each failure as an annotation (visible without opening the log).
+            awk '/^not ok/ {if (msg) print msg; msg="::error title=" $0 "::"; next}
+                 msg && /^#/ {sub(/^# ?/, ""); msg = msg $0 "%0A"; next}
+                 msg && !/^#/ {print msg; msg=""}
+                 END {if (msg) print msg}' bats.out
+            exit 1
+          fi
 
   install-script:
     runs-on: ubuntu-latest

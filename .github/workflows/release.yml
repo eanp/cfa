@@ -10,6 +10,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      # Optional: a fine-grained PAT with "Contents: read and write" on eanp/homebrew-tap.
+      TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
       - name: Check version matches tag
@@ -39,3 +42,15 @@ jobs:
           sha256sum cfa > cfa.sha256
           gh release create "$GITHUB_REF_NAME" cfa cfa.sha256 \
             --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+      - name: Update Homebrew tap
+        if: env.TAP_TOKEN != ''
+        run: |
+          url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$GITHUB_REF_NAME.tar.gz"
+          sha=$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/eanp/homebrew-tap.git" tap
+          cd tap
+          sed -i -E "s#^  url \".*\"#  url \"$url\"#; s#^  sha256 \".*\"#  sha256 \"$sha\"#" Formula/cfa.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "cfa ${GITHUB_REF_NAME#v}"
+          git push
