@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-12
+
+First stable release. From now on the following only change in a new major version:
+command names and flags, the store layout under `~/.config/cfa`, the `.cfa-account`
+format, the environment variables cfa exports, and `cfa list --json` output.
+
 ### Fixed
 
 - The shell hook falls back to `cfa` on `PATH` when the binary recorded by `cfa init`
@@ -31,5 +37,6 @@ All notable changes to this project are documented here. The format follows
 - Shell integration for zsh, bash and fish (`cfa init`) with completions.
 - Installer script, Makefile, Homebrew formula template.
 
-[Unreleased]: https://github.com/eanp/cfa/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/eanp/cfa/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/eanp/cfa/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/eanp/cfa/releases/tag/v0.1.0

@@ -5,6 +5,7 @@
 **Use several Cloudflare accounts with `wrangler` and `cloudflared` — per project, per shell, or per command.**
 
 [![CI](https://github.com/eanp/cfa/actions/workflows/ci.yml/badge.svg)](https://github.com/eanp/cfa/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/eanp/cfa)](https://github.com/eanp/cfa/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Shell: bash 3.2+](https://img.shields.io/badge/bash-3.2%2B-4EAA25)
 ![Shells: zsh · bash · fish](https://img.shields.io/badge/shells-zsh%20·%20bash%20·%20fish-555)

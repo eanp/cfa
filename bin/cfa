@@ -11,7 +11,7 @@
 set -euo pipefail
 umask 077
 
-CFA_VERSION="0.1.0"
+CFA_VERSION="1.0.0"
 CFA_URL="https://github.com/eanp/cfa"
 
 CF_DIR="$HOME/.cloudflared"
